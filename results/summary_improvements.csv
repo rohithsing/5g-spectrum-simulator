@@ -1,0 +1,5 @@
+Congestion,Throughput Gain vs Static (%),Latency Reduction vs Static (%),QoS Gain vs Static (% pts),PU Collision Reduction (% pts),DRL Fairness Index,Static Fairness Index
+Low,-54.5,31.8,4.2,19.6,0.274,0.271
+Medium,-49.3,41.3,0.3,34.6,0.182,0.218
+High,-43.2,51.2,-1.5,52.5,0.125,0.158
+Peak,-32.7,52.6,-0.5,57.9,0.119,0.145
