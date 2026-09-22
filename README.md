@@ -126,6 +126,78 @@ Open your browser at `http://localhost:8501` to explore:
 
 ---
 
+## 🐙 Pushing to GitHub
+
+The project is already initialized as a clean Git repository with a `.gitignore` configured to exclude virtual environments and cache directories.
+
+To push this repository to your GitHub account:
+
+### Step 1: Create a new repository on GitHub
+1. Go to [github.com/new](https://github.com/new).
+2. Set the repository name (e.g., `intelligent-spectrum-allocation-5g` or `5g-spectrum-simulator`).
+3. Set visibility to **Public** (required for free Streamlit Community Cloud hosting) or **Private**.
+4. **Do not** initialize with a README, .gitignore, or license (these already exist locally).
+5. Click **Create repository**.
+
+### Step 2: Link local repository and push
+Open PowerShell or your terminal in this project directory and run:
+
+```bash
+# Add your GitHub repository as remote origin (replace with your actual GitHub URL)
+git remote add origin https://github.com/<your-username>/<your-repo-name>.git
+
+# Push your code to the main branch
+git push -u origin main
+```
+
+---
+
+## 🌐 Deployment Options
+
+### Option 1: Streamlit Community Cloud (Recommended — Free & 1-Click)
+The easiest way to share this project for academic evaluations, professor reviews, or project viva:
+1. Push your code to GitHub following the steps above.
+2. Visit [share.streamlit.io](https://share.streamlit.io/) and sign in with your GitHub account.
+3. Click **New app**.
+4. Select your GitHub repository:
+   - **Repository**: `<your-username>/<your-repo-name>`
+   - **Branch**: `main`
+   - **Main file path**: `app.py`
+5. Click **Deploy!**
+   - Streamlit Cloud will automatically install dependencies from `requirements.txt`, initialize the dataset fallbacks, and give you a public URL (e.g., `https://5g-spectrum-simulator.streamlit.app`).
+   - Any future `git push` automatically redeploys the app.
+
+---
+
+### Option 2: Hugging Face Spaces (Free ML Hosting)
+1. Go to [huggingface.co/new-space](https://huggingface.co/new-space).
+2. Set Space name and license.
+3. Select **Streamlit** as the Space SDK.
+4. Clone the space or connect your GitHub repository, and push the files.
+
+---
+
+### Option 3: Docker Deployment (Self-Hosted / Cloud VPS / AWS / GCP)
+This project includes a production-ready `Dockerfile`.
+
+To build and run locally with Docker:
+```bash
+# Build the Docker image
+docker build -t 5g-spectrum-simulator .
+
+# Run the container
+docker run -d -p 8501:8501 --name 5g-simulator 5g-spectrum-simulator
+```
+Access the application at `http://localhost:8501`.
+
+To deploy on cloud virtual servers (AWS EC2, Google Cloud Compute, DigitalOcean Droplet):
+1. Install Docker on the server: `sudo apt-get update && sudo apt-get install -y docker.io`
+2. Clone your GitHub repository.
+3. Run `docker build -t 5g-simulator . && docker run -d -p 80:8501 5g-simulator`
+4. Access via your server's Public IP address.
+
+---
+
 ## 📈 Summary of Algorithms
 
 | Allocator | Class | Strategy | Cognitive PU Protection |
