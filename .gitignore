@@ -56,3 +56,6 @@ artifacts/*_tmp.pt
 # Training console logs
 train_run.log
 *.log
+
+# Quarantined checkpoints from superseded runs
+artifacts/_stale_*
