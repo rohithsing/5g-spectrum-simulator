@@ -47,3 +47,12 @@ ehthumbs.db
 *.log
 scratch/
 .system_generated/
+
+# Trained model artifacts are small and are committed for reproducibility,
+# but keep scratch runs out of git.
+artifacts/*.tmp
+artifacts/*_tmp.pt
+
+# Training console logs
+train_run.log
+*.log

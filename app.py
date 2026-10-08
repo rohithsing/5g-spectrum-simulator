@@ -1,751 +1,428 @@
+#!/usr/bin/env python
 """
-Streamlit Web Application: Intelligent Spectrum Allocation Simulator for 5G/6G Networks.
+Interactive dashboard: existing spectrum allocation vs. the proposed RL system.
 
-An interactive dashboard for evaluating, visualizing, and analyzing AI/ML and Deep RL
-spectrum allocation policies grounded in real-world 5G datasets (CASS, 5G KPI, DLTeamTUC).
+    streamlit run app.py
 """
 
-import os
-import sys
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Dict, List, Optional
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
-from scipy import stats
 
-from data_pipeline import load_kpi, load_cass, load_resource_allocation, align_datasets, generate_sample_raw_files
-from simulator import SpectrumSimulator
-from baseline_allocator import RoundRobinAllocator, ProportionalFairAllocator
-from ml_allocator import SupervisedAllocator, DuelingDQNAgent, SpectrumAllocationEnv
-from evaluate import run_single_simulation, run_benchmark
+from spectrum.baselines import build_classical
+from spectrum.config import CONGESTION_REGIMES, PARAMETER_PROVENANCE, SimConfig
+from spectrum.env import SpectrumEnv
 
-# Set page configuration
+ARTIFACTS = Path("artifacts")
+RESULTS = Path("results")
+
 st.set_page_config(
-    page_title="5G/6G Intelligent Spectrum Allocation Simulator",
+    page_title="Intelligent Spectrum Allocation",
     page_icon="📡",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-# Custom Styling
-st.markdown("""
-<style>
-    /* Metric Card styling */
-    .metric-card {
-        background: linear-gradient(135deg, rgba(30, 41, 59, 0.7), rgba(15, 23, 42, 0.8));
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        padding: 16px;
-        margin-bottom: 12px;
-        backdrop-filter: blur(10px);
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-    }
-    .metric-title {
-        font-size: 0.85rem;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        font-weight: 600;
-    }
-    .metric-value {
-        font-size: 1.75rem;
-        font-weight: 700;
-        color: #38bdf8;
-        margin: 4px 0;
-    }
-    .metric-delta {
-        font-size: 0.82rem;
-        color: #34d399;
-    }
-    .metric-delta.negative {
-        color: #f87171;
-    }
-    .badge-dsa {
-        background-color: #0284c7;
-        color: white;
-        padding: 3px 8px;
-        border-radius: 6px;
-        font-size: 0.75rem;
-        font-weight: 600;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 48px;
-        font-size: 15px;
-        font-weight: 600;
-    }
-</style>
-""", unsafe_allow_html=True)
+ACCENT = "#2f6fdb"
+MUTED = "#8a8f98"
 
 
-# =========================================================================
-# Cache Data Pipeline
-# =========================================================================
-@st.cache_data
-def get_pipeline_data():
-    generate_sample_raw_files()
-    df_cass = load_cass()
-    df_kpi, kpi_stats_dict = load_kpi()
-    df_rb = load_resource_allocation()
-    composed_df, align_meta = align_datasets(df_cass, df_kpi, df_rb, n_samples=5000)
-    return df_cass, df_kpi, kpi_stats_dict, df_rb, composed_df, align_meta
+# ---------------------------------------------------------------------------
+# loading
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_agent():
+    """Load the trained allocator, or return None if training has not run."""
+    if not (ARTIFACTS / "policy.pt").exists():
+        return None
+    from spectrum.agent import NeuroSpectrumAllocator
+
+    pred = ARTIFACTS / "predictor.pt"
+    return NeuroSpectrumAllocator.load(
+        ARTIFACTS / "policy.pt", pred if pred.exists() else None
+    )
 
 
-df_cass, df_kpi, kpi_stats_dict, df_rb, composed_df, align_meta = get_pipeline_data()
+@st.cache_resource(show_spinner=False)
+def load_predictor():
+    if not (ARTIFACTS / "predictor.pt").exists():
+        return None
+    import torch
+
+    from spectrum.predictor import GRUPredictor
+
+    m = GRUPredictor()
+    m.load_state_dict(torch.load(ARTIFACTS / "predictor.pt", map_location="cpu"))
+    m.eval()
+    return m
 
 
-# =========================================================================
-# Cache Trained Allocators
-# =========================================================================
-@st.cache_resource
-def get_allocators(num_users: int, num_channels: int):
-    rr = RoundRobinAllocator()
-    pf = ProportionalFairAllocator(sense_pu=True)
-
-    rf = SupervisedAllocator(model_type="random_forest")
-    rf.train(df_rb)
-
-    xgb = SupervisedAllocator(model_type="xgboost")
-    xgb.train(df_rb)
-
-    # Initialize DQN Agent
-    obs_dim = num_users * 6 + num_channels * 2
-    dqn = DuelingDQNAgent(state_dim=obs_dim, num_users=num_users, num_channels=num_channels)
-    env = SpectrumAllocationEnv(num_users=num_users, num_channels=num_channels, max_steps=20)
-    dqn.warm_start(env, xgb, n_episodes=2)
-    dqn.train(env, total_episodes=4)
+@st.cache_data(show_spinner=False)
+def load_results() -> Dict[str, Optional[pd.DataFrame]]:
+    def read(name):
+        p = RESULTS / name
+        return pd.read_csv(p) if p.exists() else None
 
     return {
-        "Static (Round-Robin)": rr,
-        "Proportional-Fair": pf,
-        "Supervised (Random Forest)": rf,
-        "Supervised (XGBoost)": xgb,
-        "DRL (Dueling Double DQN)": dqn
+        "kpi": read("kpi_by_regime.csv"),
+        "headline": read("headline.csv"),
+        "predictor": read("predictor_accuracy.csv"),
+        "ablation": read("ablation.csv"),
     }
 
 
-# =========================================================================
-# Sidebar Controls
-# =========================================================================
-with st.sidebar:
-    st.image("https://img.icons8.com/fluency/96/5g.png", width=64)
-    st.title("Network Parameters")
-    st.markdown("Configure 5G/6G simulation settings:")
+def allocator_registry() -> Dict[str, object]:
+    reg = {a.name: a for a in build_classical()}
+    agent = load_agent()
+    if agent is not None:
+        reg[agent.name] = agent
+    return reg
 
-    num_users = st.slider("Number of Users (UEs)", min_value=10, max_value=100, value=30, step=5)
-    num_channels = st.slider("Allocatable Channels", min_value=4, max_value=24, value=12, step=2)
 
-    congestion_level = st.selectbox(
-        "Network Congestion Tier",
-        options=["low", "medium", "high", "peak"],
-        index=1,
-        help="Maps to empirical PRB utilization percentiles from the 5G KPI dataset."
-    )
+# ---------------------------------------------------------------------------
+# live simulation
+# ---------------------------------------------------------------------------
+def simulate(allocator, cfg: SimConfig, seed: int) -> Dict[str, object]:
+    """Run one episode and keep the per-slot trace for plotting."""
+    env = SpectrumEnv(cfg, seed=seed)
+    allocator.reset(cfg)
 
-    data_source_mode = st.radio(
-        "Scenario Grounding Source",
-        options=["Empirical Aligned Datasets", "Synthetic Parametric Fallback"],
-        index=0,
-        help="Whether state features are sampled from statistically linked real datasets or parametric distributions."
-    )
+    obs = env.observe()
+    grid = np.full((cfg.slots_per_episode, cfg.n_rbg), -1, dtype=np.int64)
+    truth = np.zeros((cfg.slots_per_episode, cfg.n_subbands), dtype=np.int64)
+    series: List[Dict[str, float]] = []
 
-    available_allocators = [
-        "Static (Round-Robin)",
-        "Proportional-Fair",
-        "Supervised (Random Forest)",
-        "Supervised (XGBoost)",
-        "DRL (Dueling Double DQN)"
+    for t in range(cfg.slots_per_episode):
+        a = allocator.allocate(obs)
+        grid[t] = a
+        obs, reward, done, info = env.step(a)
+        truth[t] = info["_truth_incumbent"]
+        series.append({
+            "slot": t,
+            "Goodput (Mb/s)": info["useful_bits"] / cfg.slot_duration_s / 1e6,
+            "Collisions": info["collisions"],
+            "In-budget UEs (%)": 100.0 * info["qos_fraction"],
+            "Jain fairness": info["jain"],
+        })
+        if done:
+            break
+
+    return {
+        "summary": env.episode_summary(),
+        "series": pd.DataFrame(series),
+        "grid": grid,
+        "truth": truth,
+        "ue_class": env.traffic.ue_class.copy(),
+    }
+
+
+def occupancy_figure(res_a, res_b, cfg: SimConfig, name_a: str, name_b: str):
+    """Spectrum waterfall: who used which RBG, and where the incumbent really was."""
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2), sharey=True)
+    window = min(220, cfg.slots_per_episode)
+
+    for ax, res, title in ((axes[0], res_a, name_a), (axes[1], res_b, name_b)):
+        grid = res["grid"][:window]
+        truth = res["truth"][:window]
+        # 0 = muted, 1 = transmitted cleanly, 2 = transmitted into an incumbent
+        occupied = np.repeat(truth, cfg.rbgs_per_subband, axis=1)
+        img = np.where(grid < 0, 0, np.where(occupied == 1, 2, 1))
+        ax.imshow(
+            img.T, aspect="auto", origin="lower", interpolation="nearest",
+            cmap=matplotlib.colors.ListedColormap(["#e9ecf1", ACCENT, "#d1495b"]),
+            vmin=0, vmax=2,
+        )
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("slot")
+    axes[0].set_ylabel("resource block group")
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color="#e9ecf1"),
+        plt.Rectangle((0, 0), 1, 1, color=ACCENT),
+        plt.Rectangle((0, 0), 1, 1, color="#d1495b"),
     ]
-
-    selected_allocators = st.multiselect(
-        "Select Allocators to Run",
-        options=available_allocators,
-        default=["Static (Round-Robin)", "Proportional-Fair", "Supervised (XGBoost)", "DRL (Dueling Double DQN)"]
-    )
-
-    simulation_timesteps = st.slider("Simulation Horizon (Subframes)", min_value=10, max_value=80, value=30, step=5)
-
-    run_sim_btn = st.button("🚀 Run Live Simulation / Benchmark", type="primary", use_container_width=True)
+    fig.legend(handles, ["muted", "clean transmission", "collided with incumbent"],
+               loc="upper center", ncol=3, frameon=False, fontsize=9,
+               bbox_to_anchor=(0.5, 1.08))
+    fig.tight_layout()
+    return fig
 
 
-# =========================================================================
-# Header & Context
-# =========================================================================
-st.title("📡 Intelligent Spectrum Allocation Simulator for 5G/6G Networks")
-st.markdown(
-    """
-    **AI/ML Final-Year Engineering Capstone System**  
-    Learns dynamic spectrum allocation (DSA) policies combining empirical datasets:
-    **CASS RF Sensing** $\\times$ **5G Network KPIs** $\\times$ **DLTeamTUC Resource Allocation**
-    with 5G NR physical layer simulation.
-    """
-)
-
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Live Simulation & Grid",
-    "📈 Comparative Benchmark",
-    "🔬 Statistical Realism (KS Test)",
-    "📚 Methodology & Paper Notes"
-])
-
-
-# Get or train allocators
-allocators = get_allocators(num_users=num_users, num_channels=num_channels)
-use_aligned = (data_source_mode == "Empirical Aligned Datasets")
-
-
-# =========================================================================
-# TAB 1: Live Simulation & Spectrum Grid
-# =========================================================================
-with tab1:
-    st.subheader("Interactive 5G NR Subframe Scheduling Run")
-
-    active_allocator_name = st.selectbox(
-        "Choose Primary Allocator for Live Grid Inspector",
-        options=selected_allocators if selected_allocators else available_allocators,
-        index=len(selected_allocators) - 1 if selected_allocators else 0
-    )
-
-    allocator_obj = allocators[active_allocator_name]
-
-    sim = SpectrumSimulator(
-        num_users=num_users,
-        num_channels=num_channels,
-        congestion_level=congestion_level,
-        use_aligned_data=use_aligned,
-        composed_df=composed_df if use_aligned else None,
-        kpi_stats=kpi_stats_dict,
-        random_state=42
-    )
-
-    if hasattr(allocator_obj, "reset"):
-        allocator_obj.reset()
-
-    # Run simulation
-    grid_data = []
-    pu_grid = []
-    collision_markers = []
-    step_history = []
-
-    for t in range(simulation_timesteps):
-        u_states = sim.get_state()
-        ch_states = sim.get_channel_state()
-        alloc = allocator_obj.allocate(u_states, ch_states, num_channels)
-        info = sim.step(alloc)
-        step_history.append(info)
-
-        # Store allocation matrix row
-        row = [alloc.get(c, -1) if alloc.get(c) is not None else -1 for c in range(num_channels)]
-        grid_data.append(row)
-        pu_grid.append(ch_states["pu_present"])
-        for coll_ch in info["collision_channels"]:
-            collision_markers.append({"time": t, "channel": coll_ch})
-
-    # Summary Metrics Cards
-    avg_thpt = np.mean([s["total_throughput_mbps"] for s in step_history])
-    avg_lat = np.mean([s["mean_latency_ms"] for s in step_history])
-    avg_jain = np.mean([s["jains_fairness"] for s in step_history])
-    avg_util = np.mean([s["spectrum_utilization"] for s in step_history]) * 100.0
-    total_coll = sum([s["pu_collisions"] for s in step_history])
-    avg_qos = np.mean([s["qos_satisfaction_rate"] for s in step_history]) * 100.0
-
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Aggregate Throughput</div>
-            <div class="metric-value">{avg_thpt:.1f} <span style="font-size:1rem;">Mbps</span></div>
-            <div class="metric-delta">Target: High Rate</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Mean Latency</div>
-            <div class="metric-value">{avg_lat:.1f} <span style="font-size:1rem;">ms</span></div>
-            <div class="metric-delta">M/M/1 Queue Delay</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Jain's Fairness</div>
-            <div class="metric-value">{avg_jain:.3f}</div>
-            <div class="metric-delta">Scale: [0, 1]</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col4:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Spectrum Utilization</div>
-            <div class="metric-value">{avg_util:.1f}%</div>
-            <div class="metric-delta">PRB Load</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col5:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">QoS SLA Satisfied</div>
-            <div class="metric-value">{avg_qos:.1f}%</div>
-            <div class="metric-delta">SLA Latency Met</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col6:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">PU Collisions</div>
-            <div class="metric-value" style="color: {'#f87171' if total_coll > 0 else '#34d399'};">{total_coll}</div>
-            <div class="metric-delta">Incumbent Protection</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # 2D Heatmap of Channel Allocation over Time
-    st.markdown("#### 2D Dynamic Spectrum Allocation Grid")
-    st.caption("Rows represent spectrum channels/carriers. Columns represent subframe timesteps. Cell color indicates assigned User Equipment (UE ID).")
-
-    grid_matrix = np.array(grid_data).T  # shape (num_channels, timesteps)
-    pu_matrix = np.array(pu_grid).T
-
-    fig_grid = go.Figure()
-    fig_grid.add_trace(go.Heatmap(
-        z=grid_matrix,
-        x=list(range(simulation_timesteps)),
-        y=[f"CH-{c}" for c in range(num_channels)],
-        colorscale="Viridis",
-        colorbar=dict(title="Assigned UE ID"),
-        hoverongaps=False
-    ))
-
-    # Add collision overlay points
-    if collision_markers:
-        coll_x = [m["time"] for m in collision_markers]
-        coll_y = [f"CH-{m['channel']}" for m in collision_markers]
-        fig_grid.add_trace(go.Scatter(
-            x=coll_x,
-            y=coll_y,
-            mode="markers",
-            marker=dict(symbol="x", size=12, color="red", line=dict(width=2, color="white")),
-            name="PU Collision",
-            hoverinfo="name+x+y"
-        ))
-
-    fig_grid.update_layout(
-        title=f"Spectrum Grid Allocation: {active_allocator_name}",
-        xaxis_title="Subframe Timestep (10ms)",
-        yaxis_title="Spectrum Channel ID",
-        template="plotly_dark",
-        height=380,
-        margin=dict(l=40, r=40, t=50, b=40)
-    )
-    st.plotly_chart(fig_grid, use_container_width=True)
-
-    # Time series of Throughput & Latency
-    st.markdown("#### Instantaneous Throughput & Queuing Latency Dynamics")
-    df_ts = pd.DataFrame({
-        "Timestep": list(range(1, simulation_timesteps + 1)),
-        "Throughput (Mbps)": [s["total_throughput_mbps"] for s in step_history],
-        "Latency (ms)": [s["mean_latency_ms"] for s in step_history],
-        "Jain's Fairness": [s["jains_fairness"] for s in step_history]
-    })
-
-    fig_ts = px.line(
-        df_ts,
-        x="Timestep",
-        y=["Throughput (Mbps)", "Latency (ms)"],
-        template="plotly_dark",
-        color_discrete_sequence=["#38bdf8", "#f43f5e"]
-    )
-    fig_ts.update_layout(height=320, margin=dict(l=40, r=40, t=30, b=30))
-    st.plotly_chart(fig_ts, use_container_width=True)
-
-
-# =========================================================================
-# TAB 2: Comparative Benchmark
-# =========================================================================
-with tab2:
-    st.subheader("Multi-Allocator Performance Benchmark")
+# ---------------------------------------------------------------------------
+# pages
+# ---------------------------------------------------------------------------
+def page_overview(data):
+    st.subheader("Existing framework vs. proposed RL framework")
     st.markdown(
-        """
-        Comparison of traditional baseline allocators (**Static Round-Robin**, **Proportional-Fair**)
-        against machine learning models (**Random Forest**, **XGBoost**) and **Deep Reinforcement Learning (Dueling Double DQN)**.
-        """
+        "Both sides schedule the **same 100 MHz 5G NR carrier**, shared with a "
+        "stochastic incumbent, and both see the **same observation**: buffer status "
+        "reports, aged CQI reports and one shared energy detector. "
+        "The incumbent's true occupancy is never shown to either."
     )
 
-    # Run comparison across selected allocators
-    bench_records = []
-    with st.spinner("Simulating comparative allocator performance..."):
-        for alloc_name in selected_allocators:
-            res = run_single_simulation(
-                allocator=allocators[alloc_name],
-                num_users=num_users,
-                num_channels=num_channels,
-                congestion_level=congestion_level,
-                timesteps=simulation_timesteps,
-                composed_df=composed_df if use_aligned else None,
-                kpi_stats_dict=kpi_stats_dict,
-                random_state=42
-            )
-            bench_records.append({
-                "Allocator": alloc_name,
-                "Throughput (Mbps)": res["throughput_mean"],
-                "Latency (ms)": res["latency_mean"],
-                "P95 Latency (ms)": res["p95_latency"],
-                "Spectrum Eff (bps/Hz)": res["spectrum_efficiency_mean"],
-                "Utilization (%)": res["spectrum_utilization_mean"],
-                "Jain's Fairness": res["jains_fairness_mean"],
-                "QoS Satisfaction (%)": res["qos_satisfaction_pct"],
-                "PU Collision (%)": res["pu_collision_rate_pct"]
-            })
+    head = data["headline"]
+    if head is None:
+        st.info("Run `python evaluate.py` to populate the benchmark tables.")
+        return
 
-    df_bench = pd.DataFrame(bench_records)
+    levels = [l for l in ["low", "medium", "high", "peak"] if l in set(head["congestion"])]
+    level = st.radio("Congestion regime", levels,
+                     index=min(2, len(levels) - 1), horizontal=True)
+    sub = head[head["congestion"] == level]
 
-    # Display Leaderboard
+    featured = ["QoS satisfaction (%)", "Goodput (Mb/s)",
+                "Incumbent collisions (%)", "Deadline misses (%)"]
+    cols = st.columns(len(featured))
+    for col, metric in zip(cols, featured):
+        row = sub[sub["metric"] == metric]
+        if row.empty:
+            continue
+        row = row.iloc[0]
+        col.metric(
+            metric,
+            f"{row['proposed_mean']:.3g}",
+            f"{row['improvement_pct']:+.1f}% vs {row['best_classical'].split('(')[0].strip()}",
+        )
+
+    st.markdown("##### Full comparison against the strongest classical scheduler per metric")
+    show = sub[["metric", "best_classical", "classical_mean", "classical_ci",
+                "proposed_mean", "proposed_ci", "improvement_pct", "p_value"]].copy()
+    show.columns = ["Metric", "Best classical", "Classical", "95% CI",
+                    "Proposed", "95% CI ", "Improvement %", "p"]
     st.dataframe(
-        df_bench.style.format({
-            "Throughput (Mbps)": "{:.2f}",
-            "Latency (ms)": "{:.2f}",
-            "P95 Latency (ms)": "{:.2f}",
-            "Spectrum Eff (bps/Hz)": "{:.3f}",
-            "Utilization (%)": "{:.1f}%",
-            "Jain's Fairness": "{:.3f}",
-            "QoS Satisfaction (%)": "{:.1f}%",
-            "PU Collision (%)": "{:.2f}%"
-        }).highlight_max(subset=["Throughput (Mbps)", "Jain's Fairness", "QoS Satisfaction (%)"], color="#1e3a8a")
-          .highlight_min(subset=["Latency (ms)", "PU Collision (%)"], color="#1e3a8a"),
-        use_container_width=True
+        show.style.format({
+            "Classical": "{:,.3f}", "Proposed": "{:,.3f}",
+            "Improvement %": "{:+.1f}", "p": "{:.4f}",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Improvement is sign-corrected so positive always means better. "
+        "p is a paired Wilcoxon signed-rank test across seeds; each allocator "
+        "faced an identical UE drop, traffic realisation and incumbent trajectory."
     )
 
-    # Bar Charts Side-by-Side
-    col_a, col_b = st.columns(2)
-    with col_a:
-        fig_bar_thpt = px.bar(
-            df_bench,
-            x="Allocator",
-            y="Throughput (Mbps)",
-            color="Allocator",
-            title="Aggregate Throughput by Allocator (Higher is Better)",
-            template="plotly_dark",
-            text_auto=".1f"
-        )
-        fig_bar_thpt.update_layout(showlegend=False, height=350)
-        st.plotly_chart(fig_bar_thpt, use_container_width=True)
+    for name, caption in (
+        ("kpi_comparison.png", "KPIs across congestion regimes"),
+        ("qos_by_class.png", "QoS satisfaction by 5QI traffic class"),
+    ):
+        p = RESULTS / "plots" / name
+        if p.exists():
+            st.image(str(p), caption=caption, use_container_width=True)
 
-    with col_b:
-        fig_bar_lat = px.bar(
-            df_bench,
-            x="Allocator",
-            y="Latency (ms)",
-            color="Allocator",
-            title="Mean Queuing Latency by Allocator (Lower is Better)",
-            template="plotly_dark",
-            text_auto=".1f"
-        )
-        fig_bar_lat.update_layout(showlegend=False, height=350)
-        st.plotly_chart(fig_bar_lat, use_container_width=True)
 
-    col_c, col_d = st.columns(2)
-    with col_c:
-        fig_bar_jain = px.bar(
-            df_bench,
-            x="Allocator",
-            y="Jain's Fairness",
-            color="Allocator",
-            title="Jain's Fairness Index [0, 1] (Higher is Better)",
-            template="plotly_dark",
-            range_y=[0, 1.05],
-            text_auto=".3f"
-        )
-        fig_bar_jain.update_layout(showlegend=False, height=350)
-        st.plotly_chart(fig_bar_jain, use_container_width=True)
+def page_live(data):
+    st.subheader("Run the simulator")
+    registry = allocator_registry()
+    agent = load_agent()
 
-    with col_d:
-        fig_bar_coll = px.bar(
-            df_bench,
-            x="Allocator",
-            y="PU Collision (%)",
-            color="Allocator",
-            title="Primary User Collision Rate % (Lower is Better)",
-            template="plotly_dark",
-            text_auto=".2f"
-        )
-        fig_bar_coll.update_layout(showlegend=False, height=350)
-        st.plotly_chart(fig_bar_coll, use_container_width=True)
+    c1, c2, c3, c4 = st.columns(4)
+    names = list(registry)
+    default_b = names.index(agent.name) if agent is not None else len(names) - 1
+    name_a = c1.selectbox("Existing system", names, index=0)
+    name_b = c2.selectbox("Proposed system", names, index=default_b)
+    level = c3.selectbox("Congestion", list(CONGESTION_REGIMES), index=2)
+    slots = c4.slider("Slots (0.5 ms each)", 200, 2000, 600, step=100)
+    seed = st.number_input("Seed", min_value=0, max_value=10_000, value=42, step=1)
 
-    # Radar Chart Comparison
-    st.markdown("#### Normalized Multi-Dimensional Tradeoff Radar")
-    categories = ["Throughput", "Low Latency", "Fairness", "QoS SLA", "PU Protection"]
-
-    fig_radar = go.Figure()
-    # Normalize metrics to [0, 1] for radar plot
-    max_thpt = max(df_bench["Throughput (Mbps)"].max(), 1.0)
-    max_lat = max(df_bench["Latency (ms)"].max(), 1.0)
-    max_coll = max(df_bench["PU Collision (%)"].max(), 0.01)
-
-    for idx, row in df_bench.iterrows():
-        r_vals = [
-            row["Throughput (Mbps)"] / max_thpt,
-            1.0 - (row["Latency (ms)"] / max_lat),  # inverted so higher is better
-            row["Jain's Fairness"],
-            row["QoS Satisfaction (%)"] / 100.0,
-            1.0 - (row["PU Collision (%)"] / max_coll)  # inverted
-        ]
-        fig_radar.add_trace(go.Scatterpolar(
-            r=r_vals,
-            theta=categories,
-            fill="toself",
-            name=row["Allocator"]
-        ))
-
-    fig_radar.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-        template="plotly_dark",
-        height=450,
-        margin=dict(l=50, r=50, t=30, b=30)
+    regime = CONGESTION_REGIMES[level]
+    st.caption(
+        f"{regime.n_ue} UEs - offered load x{regime.load_multiplier:.2f} - "
+        f"incumbent duty cycle {regime.incumbent_duty_cycle:.0%} - "
+        f"{slots * 0.5:.0f} ms of simulated time"
     )
-    st.plotly_chart(fig_radar, use_container_width=True)
+
+    if not st.button("Run both", type="primary"):
+        return
+
+    cfg = SimConfig(congestion=level, seed=int(seed), slots_per_episode=int(slots))
+    with st.spinner("Simulating..."):
+        res_a = simulate(registry[name_a], cfg, int(seed))
+        res_b = simulate(registry[name_b], cfg, int(seed))
+
+    sa, sb = res_a["summary"], res_b["summary"]
+    rows = [
+        ("QoS satisfaction (%)", "qos_satisfaction_pct", True),
+        ("Goodput (Mb/s)", "goodput_mbps", True),
+        ("Spectral efficiency (b/s/Hz)", "spectral_efficiency_bps_hz", True),
+        ("Deadline misses (%)", "deadline_miss_pct", False),
+        ("p99 delay (ms)", "p99_delay_ms", False),
+        ("Incumbent collisions (%)", "collision_pct", False),
+        ("Wasted vacancy (%)", "wasted_vacancy_pct", False),
+        ("Jain fairness", "jain_fairness", True),
+        ("Allocation waste (%)", "allocation_waste_pct", False),
+    ]
+    table = []
+    for label, key, higher in rows:
+        va, vb = sa[key], sb[key]
+        delta = (vb - va) if higher else (va - vb)
+        rel = 100.0 * delta / abs(va) if va else float("nan")
+        table.append({"Metric": label, name_a: va, name_b: vb, "Improvement %": rel})
+    st.dataframe(
+        pd.DataFrame(table).style.format(
+            {name_a: "{:,.3f}", name_b: "{:,.3f}", "Improvement %": "{:+.1f}"}
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.markdown("##### Spectrum occupancy")
+    st.pyplot(occupancy_figure(res_a, res_b, cfg, name_a, name_b))
+    st.caption(
+        "Red cells are transmissions that landed on top of an active incumbent. "
+        "Light cells are resources left unused -- some necessary, some thrown away "
+        "by a false alarm."
+    )
+
+    st.markdown("##### Per-slot behaviour")
+    metric = st.selectbox(
+        "Signal", ["Goodput (Mb/s)", "In-budget UEs (%)", "Jain fairness", "Collisions"]
+    )
+    merged = pd.DataFrame({
+        "slot": res_a["series"]["slot"],
+        name_a: res_a["series"][metric].rolling(20, min_periods=1).mean(),
+        name_b: res_b["series"][metric].rolling(20, min_periods=1).mean(),
+    }).set_index("slot")
+    st.line_chart(merged, color=[MUTED, ACCENT])
+    st.caption("20-slot rolling mean.")
 
 
-# =========================================================================
-# TAB 3: Statistical Realism & KS Test
-# =========================================================================
-with tab3:
-    st.subheader("Simulator Realism Validation (Kolmogorov-Smirnov Test)")
+def page_predictor(data):
+    st.subheader("Incumbent-occupancy estimation")
+    st.markdown(
+        "The energy detector is memoryless, but incumbent bursts last tens of "
+        "slots. The learned filter accumulates evidence across that burst; the "
+        "Bayes-optimal filter is given the true Markov parameters and bounds "
+        "what any estimator can extract from the same sensing stream."
+    )
+
+    pred = data["predictor"]
+    if pred is None:
+        st.info("Run `python evaluate.py` to populate the predictor comparison.")
+        return
+
+    cols = ["accuracy", "precision", "recall", "f1", "auc", "miss_rate", "false_alarm_rate"]
+    agg = pred.groupby("estimator", sort=False)[cols].mean()
+    st.dataframe(agg.style.format("{:.4f}"), use_container_width=True)
+
+    ed = agg[agg.index.str.contains("Energy")]
+    gru = agg[agg.index.str.contains("Learned")]
+    if not ed.empty and not gru.empty:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Accuracy", f"{gru['accuracy'].iloc[0]:.1%}",
+                  f"{100 * (gru['accuracy'].iloc[0] - ed['accuracy'].iloc[0]):+.1f} pts")
+        c2.metric("Precision", f"{gru['precision'].iloc[0]:.1%}",
+                  f"{100 * (gru['precision'].iloc[0] - ed['precision'].iloc[0]):+.1f} pts")
+        c3.metric("Missed detections", f"{gru['miss_rate'].iloc[0]:.1%}",
+                  f"{100 * (gru['miss_rate'].iloc[0] - ed['miss_rate'].iloc[0]):+.1f} pts",
+                  delta_color="inverse")
+
+    p = RESULTS / "plots" / "predictor_accuracy.png"
+    if p.exists():
+        st.image(str(p), use_container_width=True)
+
+    st.markdown("##### Per regime")
+    st.dataframe(
+        pred.pivot_table(index="congestion", columns="estimator",
+                         values=["accuracy", "f1"], sort=False).round(4),
+        use_container_width=True,
+    )
+
+
+def page_ablation(data):
+    st.subheader("Where the improvement comes from")
+    st.markdown(
+        "The proposed system has two learned parts. Running each in isolation "
+        "separates better incumbent estimation from better scheduling."
+    )
+    abl = data["ablation"]
+    if abl is None:
+        st.info("Run `python evaluate.py --ablations` to populate this view.")
+        return
+    st.dataframe(abl, use_container_width=True)
+    st.caption(
+        "`+ learned sensing` is M-LWDF with the GRU front-end. "
+        "`hard sensing` is the learned scheduler trusting the raw detector. "
+        "`BC only / no RL` is the policy after imitating M-LWDF but before any "
+        "reinforcement learning -- the difference from the full system is what "
+        "RL contributed."
+    )
+
+
+def page_method():
+    st.subheader("How the testbed is built")
     st.markdown(
         """
-        To rigorously justify that our composed physical simulator faithfully reflects real-world
-        cellular distributions, we perform a **Two-Sample Kolmogorov-Smirnov (KS) Test**
-        comparing simulated throughput and latency outputs against the empirical **5G Network KPI Dataset**.
+**Physical layer.** 100 MHz carrier at 3.5 GHz (band n78), 30 kHz subcarrier
+spacing, 18 resource block groups, 0.5 ms slots. Propagation uses the 3GPP
+TR 38.901 Urban Macro NLOS path loss with log-normal shadowing. Small-scale
+fading is correlated in time (first-order Gauss-Markov with a Jakes
+coefficient from each UE's Doppler) and in frequency (exponential decay across
+RBGs), so different UEs genuinely peak on different parts of the band.
+
+**Link adaptation.** SINR maps to CQI through 3GPP TS 38.214 table 2 at a
+10 % BLER target; the scheduler picks its modulation from a *delayed,
+quantised* CQI report, so an optimistic report causes a real decode failure.
+HARQ retransmissions accumulate chase-combining gain.
+
+**Traffic.** Four 5QI bearers from TS 23.501 table 5.7.4-1 -- URLLC, VoIP,
+live video and best effort -- with bursty arrivals, per-packet delay budgets
+and packets that are *dropped* when their budget expires.
+
+**Incumbent sharing.** A two-state semi-Markov process per subband, sensed by
+an energy detector at a fixed operating point. Transmitting on an occupied
+subband is a harmful-interference event.
         """
     )
-
-    # Compute empirical vs simulated samples
-    empirical_thpt = df_kpi["throughput"].sample(n=min(1500, len(df_kpi)), random_state=42).values
-    empirical_lat = df_kpi["latency"].sample(n=min(1500, len(df_kpi)), random_state=42).values
-
-    sim_res = run_single_simulation(
-        allocator=allocators["DRL (Dueling Double DQN)"],
-        num_users=num_users,
-        num_channels=num_channels,
-        congestion_level=congestion_level,
-        timesteps=40,
-        composed_df=composed_df,
-        kpi_stats_dict=kpi_stats_dict
-    )
-    sim_thpt = sim_res["user_throughputs"]
-    sim_lat = sim_res["user_latencies"]
-
-    ks_thpt = stats.ks_2samp(empirical_thpt, sim_thpt)
-    ks_lat = stats.ks_2samp(empirical_lat, sim_lat)
-
-    ks_c1, ks_c2 = st.columns(2)
-    with ks_c1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Throughput KS Statistic (D)</div>
-            <div class="metric-value">{ks_thpt.statistic:.4f}</div>
-            <div class="metric-delta">p-value: {ks_thpt.pvalue:.4e} | Empirical Mean: {np.mean(empirical_thpt):.1f} Mbps vs Sim Mean: {np.mean(sim_thpt):.1f} Mbps</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with ks_c2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-title">Latency KS Statistic (D)</div>
-            <div class="metric-value">{ks_lat.statistic:.4f}</div>
-            <div class="metric-delta">p-value: {ks_lat.pvalue:.4e} | Empirical Mean: {np.mean(empirical_lat):.1f} ms vs Sim Mean: {np.mean(sim_lat):.1f} ms</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.info(
-        "💡 **Academic Interpretation for Paper**: The two-sample KS test assesses whether the simulation output and "
-        "the empirical 5G KPI telemetry originate from the same underlying probability distribution. "
-        "The close alignment in the probability density curves below confirms the tail-risk and queuing validity of the simulator."
-    )
-
-    # Side-by-side distribution plots
-    col_dist1, col_dist2 = st.columns(2)
-    with col_dist1:
-        df_thpt_plot = pd.DataFrame({
-            "Throughput (Mbps)": np.concatenate([empirical_thpt, sim_thpt]),
-            "Dataset": ["Empirical 5G KPI"] * len(empirical_thpt) + ["Composed Simulator (DRL)"] * len(sim_thpt)
-        })
-        fig_dist_thpt = px.histogram(
-            df_thpt_plot,
-            x="Throughput (Mbps)",
-            color="Dataset",
-            barmode="overlay",
-            marginal="box",
-            template="plotly_dark",
-            color_discrete_sequence=["#3b82f6", "#ef4444"],
-            title="Throughput Probability Density Matching"
-        )
-        fig_dist_thpt.update_layout(height=380)
-        st.plotly_chart(fig_dist_thpt, use_container_width=True)
-
-    with col_dist2:
-        df_lat_plot = pd.DataFrame({
-            "Latency (ms)": np.concatenate([empirical_lat, sim_lat]),
-            "Dataset": ["Empirical 5G KPI"] * len(empirical_lat) + ["Composed Simulator (DRL)"] * len(sim_lat)
-        })
-        fig_dist_lat = px.histogram(
-            df_lat_plot,
-            x="Latency (ms)",
-            color="Dataset",
-            barmode="overlay",
-            marginal="box",
-            template="plotly_dark",
-            color_discrete_sequence=["#3b82f6", "#ef4444"],
-            title="Latency Probability Density Matching"
-        )
-        fig_dist_lat.update_layout(height=380)
-        st.plotly_chart(fig_dist_lat, use_container_width=True)
-
-    # CASS Spectrum Activity Breakdown
-    st.markdown("#### CASS RF Spectrum Sensing Grounding")
-    cass_col1, cass_col2 = st.columns(2)
-    with cass_col1:
-        fig_cass_snr = px.histogram(
-            df_cass,
-            x="snr",
-            color="pu_present",
-            template="plotly_dark",
-            title="CASS Dataset: SNR Distribution by Primary User Status",
-            labels={"snr": "SNR (dB)", "pu_present": "PU Present (0: Idle, 1: Active)"},
-            color_discrete_sequence=["#10b981", "#f59e0b"]
-        )
-        fig_cass_snr.update_layout(height=300)
-        st.plotly_chart(fig_cass_snr, use_container_width=True)
-    with cass_col2:
-        pu_ratio = df_cass["pu_present"].mean() * 100.0
-        fig_cass_pie = px.pie(
-            names=["Channel Idle (Secondary Access Open)", "Primary User Active (Occupied)"],
-            values=[100.0 - pu_ratio, pu_ratio],
-            title="CASS Dataset: Carrier Occupancy Duty Cycle",
-            template="plotly_dark",
-            color_discrete_sequence=["#0284c7", "#e11d48"]
-        )
-        fig_cass_pie.update_layout(height=300)
-        st.plotly_chart(fig_cass_pie, use_container_width=True)
-
-
-# =========================================================================
-# TAB 4: Methodology & Paper Documentation
-# =========================================================================
-with tab4:
-    st.subheader("Methodology, Formulations & Project Documentation")
+    st.markdown("##### Information parity")
     st.markdown(
-        """
-        Exportable write-up notes and mathematical equations for the final-year engineering thesis
-        and conference paper methodology/results sections.
-        """
+        "Every allocator receives the identical `Observation` object. The "
+        "incumbent's true state is not a field of it, and `tests/"
+        "test_information_parity.py` asserts this mechanically -- including a "
+        "replay test that proves each allocator reproduces its decisions from "
+        "recorded observations alone, with no environment attached."
     )
-
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        st.markdown("### 1. Empirical Copula Statistical Linkage")
-        st.markdown(
-            r"""
-            To fuse heterogeneous data without introducing artificial synchronicity:
-            1. **CASS Physical Sensing Pool**:
-               $$(\text{SNR}, I_{\text{noise}}, \text{PU}) \sim P_{\text{CASS}}$$
-            2. **5G Cellular KPI Pool**:
-               $$(T_{\text{cell}}, L_{\text{cell}}, U_{\text{PRB}}) \sim P_{\text{KPI}}(\cdot \mid \text{Congestion})$$
-            3. **MAC Action Supervision Prior**:
-               $$a_{\text{RB}} \sim P_{\text{DLTeam}}(\cdot \mid \text{CQI}, D, P)$$
-            4. **Composite State Representation**:
-               $$\mathbf{s}_{u,t} = [D_{u,t}, \text{SNR}_{u,t}, I_{u,t}, \text{PU}_{c,t}, P_u, U_{u,t-1}]$$
-            """
-        )
-
-        st.markdown("### 2. Physical Layer Channel Capacity")
-        st.markdown(
-            r"""
-            $$\text{SINR}_{u,c} = \frac{P_{\text{rx},u,c}}{N_0 + I_{\text{intercell}} + I_{\text{PU}}}$$
-            $$R_{u,c} = \eta \cdot B \cdot \log_2(1 + \text{SINR}_{u,c})$$
-            Where $B = 20\text{ MHz}$, $\eta = 0.75$, and $I_{\text{PU}} = +35\text{ dB}$ upon collision.
-            """
-        )
-
-    with col_m2:
-        st.markdown("### 3. Empirical KPI-Normalized Reward Function")
-        st.markdown(
-            r"""
-            Reward components normalized using real-world 5G KPI mean ($\mu$) and standard deviation ($\sigma$):
-            $$R_t = w_1 \left(\frac{T_t - \mu_T}{\sigma_T}\right) - w_2 \left(\frac{L_t - \mu_L}{\sigma_L}\right) + w_3 \left(\frac{U_t - \mu_U}{\sigma_U}\right) + w_4 J(t) - w_5 N_{\text{coll}}$$
-            - Throughput: $\mu_T = 42.1\text{ Mbps}, \sigma_T = 32.1\text{ Mbps}$
-            - Latency: $\mu_L = 11.6\text{ ms}, \sigma_L = 3.2\text{ ms}$
-            - PRB Utilization: $\mu_U = 0.30, \sigma_U = 0.14$
-            """
-        )
-
-        st.markdown("### 4. Jain's Fairness Index")
-        st.markdown(
-            r"""
-            $$J(t) = \frac{\left(\sum_{i=1}^N R_{i,t}\right)^2}{N \sum_{i=1}^N R_{i,t}^2} \in \left[\frac{1}{N}, 1\right]$$
-            Guarantees starvation mitigation across best-effort, streaming, and URLLC traffic classes.
-            """
-        )
-
-    st.markdown("---")
-    st.markdown("### System Architecture Diagram")
-    st.markdown(
-        """
-```mermaid
-graph TD
-    subgraph Data Layer
-        D1["CASS RF Sensing Dataset (data/raw/cass_spectrum.csv)"]
-        D2["5G KPI Dataset (data/raw/5g_kpi.csv)"]
-        D3["5G RB Allocation Dataset (data/raw/5g_resource_allocation.csv)"]
-    end
-
-    subgraph Data Pipeline & Linkage
-        P1["Data Cleaning & Resampling"]
-        P2["KPI Reward Normalization Constants (μ, σ)"]
-        P3["Statistical Linkage Engine"]
-        D1 --> P1
-        D2 --> P2
-        D3 --> P3
-        P1 --> P3
-        P2 --> P3
-    end
-
-    subgraph Simulation & Gym Environment
-        S1["Composed Scenario Generator (Low/Med/High/Peak)"]
-        S2["5G NR Simulator (Shannon Capacity, M/M/1 Queuing, PU Collisions)"]
-        S3["Gymnasium Environment (SpectrumAllocationEnv)"]
-        P3 --> S1
-        S1 --> S2
-        S2 --> S3
-    end
-
-    subgraph Allocator Policies
-        A1["Static Round-Robin"]
-        A2["Proportional-Fair Scheduler"]
-        A3["Supervised Warm-Start (XGBoost / Random Forest)"]
-        A4["Dueling Double DQN Agent"]
-        A3 -.->|Action Prior Warm-Start| A4
-    end
-
-    subgraph Evaluation & Dashboard
-        E1["Benchmark Suite (evaluate.py)"]
-        E2["KS-Test Realism Sanity Check"]
-        E3["Interactive Streamlit Dashboard (app.py)"]
-        S3 --> E1
-        A1 --> E1
-        A2 --> E1
-        A3 --> E1
-        A4 --> E1
-        E1 --> E2
-        E1 --> E3
-    end
-```
-        """
+    st.markdown("##### Parameter provenance")
+    st.dataframe(
+        pd.DataFrame(
+            [{"Parameter": k, "Source": v} for k, v in PARAMETER_PROVENANCE.items()]
+        ),
+        use_container_width=True, hide_index=True,
     )
 
 
-# Footer
-st.markdown("---")
-st.caption("5G/6G Intelligent Spectrum Allocation Simulator | Built for AI/ML Engineering Capstone & Academic Publication")
+# ---------------------------------------------------------------------------
+def main() -> None:
+    st.title("Intelligent Spectrum Allocation for 5G/6G Networks")
+    st.caption(
+        "Reinforcement-learning dynamic spectrum allocation, benchmarked against "
+        "the schedulers deployed today under strict information parity."
+    )
+
+    data = load_results()
+    if load_agent() is None:
+        st.warning("No trained policy found. Run `python train.py`, then `python evaluate.py`.")
+
+    tabs = st.tabs(
+        ["Overview", "Live simulation", "Occupancy prediction", "Ablation", "Methodology"]
+    )
+    with tabs[0]:
+        page_overview(data)
+    with tabs[1]:
+        page_live(data)
+    with tabs[2]:
+        page_predictor(data)
+    with tabs[3]:
+        page_ablation(data)
+    with tabs[4]:
+        page_method()
+
+
+if __name__ == "__main__":
+    main()

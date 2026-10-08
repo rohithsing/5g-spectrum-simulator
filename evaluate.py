@@ -1,512 +1,488 @@
+#!/usr/bin/env python
 """
-Evaluation and Benchmarking Module for Intelligent Spectrum Allocation.
+Benchmark the proposed allocator against the classical schedulers.
 
-Conducts comprehensive multi-scenario experiments comparing:
-- Baseline Allocators: Static Round-Robin, Proportional-Fair (PF)
-- Supervised Allocators: Random Forest, XGBoost
-- Deep Reinforcement Learning: Dueling Double DQN
+Produces, in ``results/``:
 
-Computes:
-1. Spectrum Efficiency (bits/s/Hz)
-2. Aggregate Throughput (Mbps)
-3. Latency (mean & 95th percentile, ms)
-4. Spectrum Utilization (%)
-5. Jain's Fairness Index
-6. QoS Satisfaction Rate (%)
-7. Primary User Collision Rate (%)
-8. Two-Sample Kolmogorov-Smirnov (KS) Test for distribution realism vs empirical 5G KPI data.
+* ``kpi_by_regime.csv``      -- every KPI, every allocator, every congestion tier
+* ``headline.csv/.md``       -- proposed vs. best classical, with bootstrap CIs
+* ``predictor_accuracy.csv`` -- occupancy-estimation accuracy / precision / recall
+* ``ablation.csv``           -- which component contributes what
+* ``significance.csv``       -- paired tests against the strongest baseline
+* ``plots/*.png``            -- figures for the report
 
-Auto-saves tables, plots, and methodology documentation in results/.
+Every allocator is run on an identical set of seeds, so each comparison is
+paired: the same UE drop, the same traffic realisation and the same incumbent
+trajectory are presented to all of them.
+
+    python evaluate.py              # full benchmark
+    python evaluate.py --seeds 3    # quicker
 """
 
-import os
-import logging
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List
+
 import numpy as np
 import pandas as pd
-from scipy import stats
-import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend
-import matplotlib.pyplot as plt
-import seaborn as sns
+import torch
 
-from data_pipeline import load_kpi, load_cass, align_datasets
-from simulator import SpectrumSimulator
-from baseline_allocator import RoundRobinAllocator, ProportionalFairAllocator
-from ml_allocator import SupervisedAllocator, DuelingDQNAgent, SpectrumAllocationEnv
+from spectrum.agent import NeuroSpectrumAllocator, PredictorAugmentedBaseline
+from spectrum.baselines import MLWDF, build_classical
+from spectrum.config import PARAMETER_PROVENANCE, SimConfig
+from spectrum.incumbent import IncumbentProcess
+from spectrum.policy import SchedulerPolicy
+from spectrum.predictor import (
+    BayesFilter,
+    EnergyDetector,
+    GRUPredictor,
+    classification_report,
+)
+from spectrum.runner import run_episode
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("Evaluation")
+ARTIFACTS = Path("artifacts")
+RESULTS = Path("results")
+LEVELS = ["low", "medium", "high", "peak"]
+
+#: Metrics where a larger value is better.
+HIGHER_IS_BETTER = {
+    "goodput_mbps", "spectral_efficiency_bps_hz", "qos_satisfaction_pct",
+    "jain_fairness", "prb_utilisation_pct", "demand_served_pct",
+    "qos_URLLC_pct", "qos_VoIP_pct", "qos_eMBB-Video_pct", "qos_BestEffort_pct",
+}
+
+HEADLINE_METRICS = [
+    ("qos_satisfaction_pct", "QoS satisfaction (%)"),
+    ("goodput_mbps", "Goodput (Mb/s)"),
+    ("spectral_efficiency_bps_hz", "Spectral efficiency (b/s/Hz)"),
+    ("deadline_miss_pct", "Deadline misses (%)"),
+    ("p99_delay_ms", "p99 delay (ms)"),
+    ("collision_pct", "Incumbent collisions (%)"),
+    ("wasted_vacancy_pct", "Wasted vacancy (%)"),
+    ("jain_fairness", "Jain fairness"),
+    ("allocation_waste_pct", "Allocation waste (%)"),
+]
 
 
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def run_single_simulation(
-    allocator: Any,
-    num_users: int = 30,
-    num_channels: int = 12,
-    congestion_level: str = "medium",
-    timesteps: int = 40,
-    composed_df: Optional[pd.DataFrame] = None,
-    kpi_stats_dict: Optional[Dict[str, Dict[str, float]]] = None,
-    random_state: int = 42
-) -> Dict[str, Any]:
-    """
-    Run an allocation simulation for a specified number of subframe timesteps.
-    """
-    sim = SpectrumSimulator(
-        num_users=num_users,
-        num_channels=num_channels,
-        congestion_level=congestion_level,
-        composed_df=composed_df,
-        kpi_stats=kpi_stats_dict,
-        random_state=random_state
+# ---------------------------------------------------------------------------
+# statistics
+# ---------------------------------------------------------------------------
+def bootstrap_ci(x: np.ndarray, n_boot: int = 10_000, alpha: float = 0.05, seed: int = 0):
+    """Percentile bootstrap confidence interval of the mean."""
+    x = np.asarray(x, dtype=float)
+    if x.size < 2:
+        return float(np.mean(x)), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    means = rng.choice(x, size=(n_boot, x.size), replace=True).mean(axis=1)
+    return (
+        float(np.mean(x)),
+        float(np.percentile(means, 100 * alpha / 2)),
+        float(np.percentile(means, 100 * (1 - alpha / 2))),
     )
 
-    # Reset allocator if stateful
-    if hasattr(allocator, "reset"):
-        allocator.reset()
 
-    thpt_list, lat_list, util_list, eff_list, jain_list, qos_list, coll_list = [], [], [], [], [], [], []
-    all_user_throughputs = []
-    all_user_latencies = []
-
-    for t in range(timesteps):
-        user_states = sim.get_state()
-        channel_states = sim.get_channel_state()
-
-        # Generate allocation decision
-        alloc = allocator.allocate(user_states, channel_states, num_channels)
-        step_info = sim.step(alloc)
-
-        thpt_list.append(step_info["total_throughput_mbps"])
-        lat_list.append(step_info["mean_latency_ms"])
-        util_list.append(step_info["spectrum_utilization"])
-        eff_list.append(step_info["spectrum_efficiency_bps_hz"])
-        jain_list.append(step_info["jains_fairness"])
-        qos_list.append(step_info["qos_satisfaction_rate"])
-        coll_list.append(step_info["pu_collisions"])
-
-        all_user_throughputs.extend(step_info["user_throughputs"])
-        all_user_latencies.extend(step_info["user_latencies"])
-
-    total_alloc_ops = timesteps * num_channels
-    collision_rate = (sum(coll_list) / max(1, total_alloc_ops)) * 100.0
-
-    return {
-        "throughput_mean": float(np.mean(thpt_list)),
-        "throughput_std": float(np.std(thpt_list)),
-        "latency_mean": float(np.mean(lat_list)),
-        "latency_std": float(np.std(lat_list)),
-        "p95_latency": float(np.percentile(lat_list, 95)),
-        "spectrum_efficiency_mean": float(np.mean(eff_list)),
-        "spectrum_utilization_mean": float(np.mean(util_list) * 100.0),
-        "jains_fairness_mean": float(np.mean(jain_list)),
-        "jains_fairness_std": float(np.std(jain_list)),
-        "qos_satisfaction_pct": float(np.mean(qos_list) * 100.0),
-        "pu_collision_rate_pct": float(collision_rate),
-        "user_throughputs": np.array(all_user_throughputs),
-        "user_latencies": np.array(all_user_latencies)
-    }
-
-
-def run_benchmark(
-    num_users: int = 30,
-    num_channels: int = 12,
-    timesteps: int = 30,
-    episodes: int = 3,
-    quick_drl_train: bool = True,
-    results_dir: str = "results"
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def wilcoxon_signed_rank(a: np.ndarray, b: np.ndarray) -> Dict[str, float]:
     """
-    Execute full benchmarking suite comparing Round-Robin, Proportional-Fair,
-    Random Forest, XGBoost, and Dueling Double DQN across congestion tiers.
+    Exact-ish paired Wilcoxon signed-rank test with a normal approximation.
+
+    Used instead of a t-test because KPI distributions across seeds are skewed
+    and the sample is small.
     """
-    out_path = Path(results_dir)
-    plots_path = out_path / "plots"
-    _ensure_dir(out_path)
-    _ensure_dir(plots_path)
+    d = np.asarray(a, float) - np.asarray(b, float)
+    n_total = d.size
+    d = d[d != 0]
+    n = d.size
+    if n == 0:
+        # The two allocators were identical on every seed: no evidence of a
+        # difference, rather than an undefined test.
+        return {"n": n_total, "statistic": 0.0, "z": 0.0, "p_value": 1.0}
+    if n < 3:
+        return {"n": n, "statistic": float("nan"), "z": float("nan"), "p_value": float("nan")}
 
-    # 1. Prepare aligned data and empirical KPI stats
-    composed_df, align_meta = align_datasets(n_samples=5000)
-    df_kpi, kpi_stats_dict = load_kpi()
+    order = np.argsort(np.abs(d), kind="mergesort")
+    ranks = np.empty(n, dtype=float)
+    ranks[order] = np.arange(1, n + 1)
+    absd = np.abs(d)[order]
+    i = 0
+    while i < n:  # average tied ranks
+        j = i
+        while j + 1 < n and absd[j + 1] == absd[i]:
+            j += 1
+        if j > i:
+            ranks[order[i : j + 1]] = 0.5 * (i + j) + 1.0
+        i = j + 1
 
-    # 2. Instantiate and train allocators
-    logger.info("Initializing allocators for benchmark...")
-    rr = RoundRobinAllocator()
-    pf = ProportionalFairAllocator(sense_pu=True)
+    w_plus = float(np.sum(ranks[d > 0]))
+    w_minus = float(np.sum(ranks[d < 0]))
+    w = min(w_plus, w_minus)
+    mean_w = n * (n + 1) / 4.0
+    std_w = np.sqrt(n * (n + 1) * (2 * n + 1) / 24.0)
+    z = (w - mean_w) / max(std_w, 1e-12)
+    # Two-sided normal approximation to the signed-rank null distribution.
+    p = _erfc(abs(z) / np.sqrt(2.0))
+    return {"n": n, "statistic": w, "z": float(z), "p_value": float(min(p, 1.0))}
 
-    rf = SupervisedAllocator(model_type="random_forest")
-    rf.train()
 
-    xgb = SupervisedAllocator(model_type="xgboost")
-    xgb.train()
+def _erfc(x: float) -> float:
+    import math
 
-    # Deep RL Agent Setup
-    dummy_env = SpectrumAllocationEnv(num_users=num_users, num_channels=num_channels, max_steps=timesteps)
-    obs_dim = dummy_env.observation_space.shape[0]
-    ddqn = DuelingDQNAgent(state_dim=obs_dim, num_users=num_users, num_channels=num_channels)
+    return math.erfc(x)
 
-    if quick_drl_train:
-        ddqn.warm_start(dummy_env, xgb, n_episodes=2)
-        ddqn.train(dummy_env, total_episodes=4)
 
-    allocator_dict = {
-        "Static (Round-Robin)": rr,
-        "Proportional-Fair": pf,
-        "Supervised (Random Forest)": rf,
-        "Supervised (XGBoost)": xgb,
-        "DRL (Dueling Double DQN)": ddqn
-    }
+def cliffs_delta(a: np.ndarray, b: np.ndarray) -> float:
+    """Non-parametric effect size in [-1, 1]."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    gt = np.sum(a[:, None] > b[None, :])
+    lt = np.sum(a[:, None] < b[None, :])
+    return float((gt - lt) / (a.size * b.size))
 
-    congestion_tiers = ["low", "medium", "high", "peak"]
-    benchmark_records = []
-    simulated_thpt_samples = []
-    simulated_lat_samples = []
 
-    logger.info("Executing benchmark across %d allocators and %d congestion scenarios...", len(allocator_dict), len(congestion_tiers))
+# ---------------------------------------------------------------------------
+# benchmark
+# ---------------------------------------------------------------------------
+def build_allocators(args) -> List:
+    allocators = build_classical()
 
-    for tier in congestion_tiers:
-        logger.info("--- Evaluating Congestion Tier: %s ---", tier.upper())
-        for name, alloc in allocator_dict.items():
-            ep_metrics = []
-            for ep in range(episodes):
-                res = run_single_simulation(
-                    allocator=alloc,
-                    num_users=num_users,
-                    num_channels=num_channels,
-                    congestion_level=tier,
-                    timesteps=timesteps,
-                    composed_df=composed_df,
-                    kpi_stats_dict=kpi_stats_dict,
-                    random_state=42 + ep * 13
-                )
-                ep_metrics.append(res)
-                if name == "DRL (Dueling Double DQN)":
-                    simulated_thpt_samples.extend(res["user_throughputs"])
-                    simulated_lat_samples.extend(res["user_latencies"])
+    policy_path = ARTIFACTS / "policy.pt"
+    predictor_path = ARTIFACTS / "predictor.pt"
+    if not policy_path.exists():
+        raise SystemExit("artifacts/policy.pt not found -- run `python train.py` first.")
 
-            mean_thpt = float(np.mean([m["throughput_mean"] for m in ep_metrics]))
-            std_thpt = float(np.mean([m["throughput_std"] for m in ep_metrics]))
-            mean_lat = float(np.mean([m["latency_mean"] for m in ep_metrics]))
-            p95_lat = float(np.mean([m["p95_latency"] for m in ep_metrics]))
-            mean_eff = float(np.mean([m["spectrum_efficiency_mean"] for m in ep_metrics]))
-            mean_util = float(np.mean([m["spectrum_utilization_mean"] for m in ep_metrics]))
-            mean_jain = float(np.mean([m["jains_fairness_mean"] for m in ep_metrics]))
-            mean_qos = float(np.mean([m["qos_satisfaction_pct"] for m in ep_metrics]))
-            mean_coll = float(np.mean([m["pu_collision_rate_pct"] for m in ep_metrics]))
+    predictor = None
+    if predictor_path.exists():
+        predictor = GRUPredictor()
+        predictor.load_state_dict(torch.load(predictor_path, map_location="cpu"))
+        predictor.eval()
 
-            benchmark_records.append({
-                "Congestion": tier.capitalize(),
-                "Allocator": name,
-                "Throughput (Mbps)": round(mean_thpt, 2),
-                "Throughput Std": round(std_thpt, 2),
-                "Latency Mean (ms)": round(mean_lat, 2),
-                "Latency P95 (ms)": round(p95_lat, 2),
-                "Spectrum Eff (bps/Hz)": round(mean_eff, 3),
-                "Utilization (%)": round(mean_util, 1),
-                "Jain's Fairness": round(mean_jain, 3),
-                "QoS Satisfaction (%)": round(mean_qos, 1),
-                "PU Collision (%)": round(mean_coll, 2)
-            })
-
-    df_results = pd.DataFrame(benchmark_records)
-
-    # Compute % Improvement of DRL over Static Round-Robin baseline
-    summary_improvements = []
-    for tier in ["Low", "Medium", "High", "Peak"]:
-        sub = df_results[df_results["Congestion"] == tier]
-        static_row = sub[sub["Allocator"] == "Static (Round-Robin)"].iloc[0]
-        pf_row = sub[sub["Allocator"] == "Proportional-Fair"].iloc[0]
-        drl_row = sub[sub["Allocator"] == "DRL (Dueling Double DQN)"].iloc[0]
-
-        thpt_gain = ((drl_row["Throughput (Mbps)"] - static_row["Throughput (Mbps)"]) / static_row["Throughput (Mbps)"]) * 100.0
-        lat_reduct = ((static_row["Latency Mean (ms)"] - drl_row["Latency Mean (ms)"]) / static_row["Latency Mean (ms)"]) * 100.0
-        qos_gain = drl_row["QoS Satisfaction (%)"] - static_row["QoS Satisfaction (%)"]
-        coll_reduct = static_row["PU Collision (%)"] - drl_row["PU Collision (%)"]
-
-        summary_improvements.append({
-            "Congestion": tier,
-            "Throughput Gain vs Static (%)": round(thpt_gain, 1),
-            "Latency Reduction vs Static (%)": round(lat_reduct, 1),
-            "QoS Gain vs Static (% pts)": round(qos_gain, 1),
-            "PU Collision Reduction (% pts)": round(coll_reduct, 1),
-            "DRL Fairness Index": drl_row["Jain's Fairness"],
-            "Static Fairness Index": static_row["Jain's Fairness"]
-        })
-
-    df_improvements = pd.DataFrame(summary_improvements)
-
-    # =========================================================================
-    # Realism Sanity Check: Two-Sample Kolmogorov-Smirnov (KS) Test
-    # =========================================================================
-    empirical_thpt = df_kpi["throughput"].values
-    empirical_lat = df_kpi["latency"].values
-
-    sim_thpt = np.array(simulated_thpt_samples)
-    sim_lat = np.array(simulated_lat_samples)
-
-    ks_thpt = stats.ks_2samp(empirical_thpt, sim_thpt)
-    ks_lat = stats.ks_2samp(empirical_lat, sim_lat)
-
-    ks_report = {
-        "throughput_ks_statistic": float(ks_thpt.statistic),
-        "throughput_p_value": float(ks_thpt.pvalue),
-        "latency_ks_statistic": float(ks_lat.statistic),
-        "latency_p_value": float(ks_lat.pvalue),
-        "empirical_thpt_mean": float(np.mean(empirical_thpt)),
-        "simulated_thpt_mean": float(np.mean(sim_thpt)),
-        "empirical_lat_mean": float(np.mean(empirical_lat)),
-        "simulated_lat_mean": float(np.mean(sim_lat)),
-        "interpretation": (
-            "The two-sample KS test quantifies the empirical distance between simulated distributions "
-            "and real-world 5G KPI measurements. Low KS statistics demonstrate that the simulator's "
-            "M/M/1 queuing dynamics and Shannon physical layer preserve empirical tail behavior."
+    if args.ablations and predictor is not None:
+        # (a) classical scheduler, learned sensing front-end
+        allocators.append(PredictorAugmentedBaseline(MLWDF(), predictor))
+        # (b) learned scheduler, classical sensing front-end
+        pol_no_pred = SchedulerPolicy()
+        pol_no_pred.load_state_dict(torch.load(policy_path, map_location="cpu"))
+        pol_no_pred.eval()
+        allocators.append(
+            NeuroSpectrumAllocator(
+                pol_no_pred, predictor=None, name="NeuroSpectrum, hard sensing (ablation)"
+            )
         )
-    }
+        # (c) behaviour-cloned policy before any RL
+        bc_path = ARTIFACTS / "policy_bc.pt"
+        if bc_path.exists():
+            pol_bc = SchedulerPolicy()
+            pol_bc.load_state_dict(torch.load(bc_path, map_location="cpu"))
+            pol_bc.eval()
+            allocators.append(
+                NeuroSpectrumAllocator(
+                    pol_bc, predictor, name="NeuroSpectrum, BC only / no RL (ablation)"
+                )
+            )
 
-    # =========================================================================
-    # Auto-save CSVs and Summary Markdown
-    # =========================================================================
-    csv_path = out_path / "benchmark_results.csv"
-    df_results.to_csv(csv_path, index=False)
-    logger.info("Saved benchmark results to '%s'", csv_path)
-
-    imp_path = out_path / "summary_improvements.csv"
-    df_improvements.to_csv(imp_path, index=False)
-
-    summary_md_path = out_path / "benchmark_summary.md"
-    _write_markdown_summary(summary_md_path, df_results, df_improvements, ks_report)
-
-    # Auto-generate methodology paper notes
-    methodology_path = out_path / "methodology_notes.md"
-    _write_methodology_notes(methodology_path, align_meta, ks_report, df_results, df_improvements)
-
-    # =========================================================================
-    # Auto-generate Publication-Quality Visualizations
-    # =========================================================================
-    _plot_benchmark_bars(df_results, plots_path / "allocator_comparison.png")
-    _plot_ks_sanity_check(empirical_thpt, sim_thpt, empirical_lat, sim_lat, ks_report, plots_path / "kpi_distribution_comparison.png")
-    _plot_fairness_vs_congestion(df_results, plots_path / "fairness_vs_congestion.png")
-
-    logger.info("Evaluation complete! Visualizations and notes generated in '%s'.", out_path)
-    return df_results, ks_report
+    allocators.append(NeuroSpectrumAllocator.load(policy_path, predictor_path))
+    return allocators
 
 
-def _write_markdown_summary(
-    path: Path,
-    df_results: pd.DataFrame,
-    df_improvements: pd.DataFrame,
-    ks_report: Dict[str, Any]
-) -> None:
-    """Generate Markdown summary table for direct paper inclusion."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# 5G/6G Intelligent Spectrum Allocation: Benchmark Results\n\n")
-        f.write("### Allocator Performance Comparison across Congestion Scenarios\n\n")
-        f.write(df_results.to_markdown(index=False))
-        f.write("\n\n### Percentage Improvements: DRL vs Static Round-Robin Baseline\n\n")
-        f.write(df_improvements.to_markdown(index=False))
-        f.write("\n\n### Statistical Realism Sanity Check (Two-Sample KS Test)\n\n")
-        f.write(f"- **Throughput KS Statistic**: {ks_report['throughput_ks_statistic']:.4f} (p-value: {ks_report['throughput_p_value']:.4e})\n")
-        f.write(f"- **Latency KS Statistic**: {ks_report['latency_ks_statistic']:.4f} (p-value: {ks_report['latency_p_value']:.4e})\n")
-        f.write(f"- **Empirical vs Simulated Throughput Mean**: {ks_report['empirical_thpt_mean']:.2f} Mbps vs {ks_report['simulated_thpt_mean']:.2f} Mbps\n")
-        f.write(f"- **Empirical vs Simulated Latency Mean**: {ks_report['empirical_lat_mean']:.2f} ms vs {ks_report['simulated_lat_mean']:.2f} ms\n\n")
-        f.write(f"> {ks_report['interpretation']}\n")
+def run_benchmark(allocators, seeds: List[int], levels: List[str], slots: int) -> pd.DataFrame:
+    records = []
+    total = len(allocators) * len(levels) * len(seeds)
+    done = 0
+    for level in levels:
+        for seed in seeds:
+            cfg = SimConfig(congestion=level, seed=seed, slots_per_episode=slots)
+            for alloc in allocators:
+                res = run_episode(alloc, cfg, seed)
+                res = {k: v for k, v in res.items() if not k.startswith("_")}
+                res["allocator"] = alloc.name
+                res["short"] = getattr(alloc, "short_name", alloc.name)
+                res["congestion"] = level
+                res["seed"] = seed
+                records.append(res)
+                done += 1
+                print(f"\r  {done}/{total} episodes", end="", flush=True)
+    print()
+    return pd.DataFrame(records)
 
 
-def _write_methodology_notes(
-    path: Path,
-    align_meta: Dict[str, Any],
-    ks_report: Dict[str, Any],
-    df_results: pd.DataFrame,
-    df_improvements: pd.DataFrame
-) -> None:
-    """
-    Generate the formal methodology and experimental write-up notes needed for the
-    final-year project thesis / conference paper dataset and results sections.
-    """
-    content = f"""# Methodology & Experimental Results Documentation
-*For Final-Year AI/ML Engineering Capstone Paper*
+def predictor_accuracy(slots: int = 6000) -> pd.DataFrame:
+    """Score the three occupancy estimators on held-out incumbent traces."""
+    path = ARTIFACTS / "predictor.pt"
+    if not path.exists():
+        return pd.DataFrame()
+    model = GRUPredictor()
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.eval()
 
-## 1. System Architecture & Dataset Grounding
+    rows = []
+    for level in LEVELS:
+        cfg = SimConfig(congestion=level)
+        rng = np.random.default_rng(7_000_000 + LEVELS.index(level))
+        inc = IncumbentProcess(cfg, rng)
+        det = EnergyDetector(inc.threshold)
+        bayes = BayesFilter(inc.p_on, inc.p_off, inc.mu_h1, inc.duty_cycle)
+        bayes.reset(cfg.n_subbands)
+        model.reset(cfg.n_subbands)
 
-Dynamic Spectrum Allocation (DSA) in 5G/6G cognitive networks requires addressing a core data heterogeneity challenge: physical layer radio frequency (RF) sensing, medium access control (MAC) subframe scheduling, and cell-wide quality-of-service (QoS) telemetry operate across fundamentally different temporal and spatial dimensions.
+        truth, p_ed, p_bf, p_gru = [], [], [], []
+        for _ in range(slots):
+            d, e = inc.sense()
+            truth.append(inc.active.copy())
+            p_ed.append(det.probability(d, e))
+            p_bf.append(bayes.probability(d, e))
+            p_gru.append(model.probability(d, e))
+            inc.advance()
 
-Our framework integrates three real-world empirical datasets:
-1. **CASS Spectrum Sensing Dataset (`data/raw/cass_spectrum.csv`)**: Time-indexed primary user (PU) occupancy flags, signal power (dBm), carrier noise floors, and signal-to-noise ratios (SNR).
-2. **5G Cellular Network KPI Dataset (`data/raw/5g_kpi.csv`)**: Empirical distributions of per-cell aggregate throughput, packet latency, packet loss rate, and Physical Resource Block (PRB) utilization across diverse network load conditions.
-3. **DLTeamTUC 5G Resource Allocation Dataset (`data/raw/5g_resource_allocation.csv`)**: Fine-grained Channel Quality Indicator (CQI 1-15) mappings and RB group assignment labels.
-
-### Statistical Linkage Methodology
-Because these datasets do not share synchronized timestamps or unique user identifiers, a brittle row-level join is mathematically invalid. Instead, we implement an **Empirical Copula Statistical Linkage**:
-- The CASS dataset establishes the empirical channel state distribution $P(\\text{{SNR}}, I, \\text{{PU}} \\mid \\text{{Channel}})$.
-- The 5G KPI dataset establishes the load-conditioned QoS distribution $P(\\text{{Throughput}}, \\text{{Latency}}, \\text{{PRB}} \\mid \\text{{Congestion Tier}})$.
-- The DLTeamTUC dataset defines action prior $P(\\text{{RB Allocated}} \\mid \\text{{CQI}}, \\text{{Demand}}, \\text{{Priority}})$.
-- We compose these marginals into empirically grounded simulation tuples:
-  $$\\mathbf{{s}}_{{u,t}} = [D_{{u,t}}, \\text{{SNR}}_{{u,t}}, I_{{u,t}}, \\text{{PU}}_{{c,t}}, P_u, U_{{u,t-1}}]$$
-
-## 2. Mathematical Formulation & Physical Layer Models
-
-### Shannon Achievable Rate with Practical Implementation Efficiency
-$$\\text{{SINR}}_{{u,c}} = \\frac{{P_{{rx,u,c}}}}{{N_0 + I_{{\\text{{intercell}}}} + I_{{\\text{{PU}}}}}}$$
-$$R_{{u,c}} = \\eta \\cdot B \\cdot \\log_2(1 + \\text{{SINR}}_{{u,c}})$$
-where $B = 20\\text{{ MHz}}$, $\\eta = 0.75$ accounts for 3GPP TS 38.214 modulation and coding scheme (MCS) discrete bounds, and $I_{{\\text{{PU}}}}$ introduces a $+35\\text{{ dB}}$ interference penalty if Secondary Users collide with an active Primary User band.
-
-### M/M/1 Queuing Latency Dynamics
-$$T_{{\\text{{lat}},u}} = \\frac{{D_{{u,\\text{{served}}}}}}{{R_u}} + \\frac{{\\text{{Backlog}}_{{u,t}}}}{{R_u + \\epsilon}}$$
-where $\\text{{Backlog}}_{{u,t+1}} = \\max(0, \\text{{Backlog}}_{{u,t}} + D_{{u,t}} - R_{{u,t}})$.
-
-### Jain's Fairness Index
-$$J(t) = \\frac{{\\left(\\sum_{{i=1}}^N R_{{i,t}}\\right)^2}}{{N \\sum_{{i=1}}^N R_{{i,t}}^2}} \\in [1/N, 1]$$
-
-### Empirical KPI-Normalized Reward Function for DRL
-To eliminate arbitrary reward hyperparameter tuning across disparate unit scales (Mbps vs ms vs utilization %), the reward function normalizes each physical metric using the real-world 5G KPI empirical mean ($\\mu$) and standard deviation ($\\sigma$):
-$$R_t = w_{{\\text{{thpt}}}} \\left(\\frac{{T_t - \\mu_T}}{{\\sigma_T}}\\right) - w_{{\\text{{lat}}}} \\left(\\frac{{L_t - \\mu_L}}{{\\sigma_L}}\\right) + w_{{\\text{{util}}}} \\left(\\frac{{U_t - \\mu_U}}{{\\sigma_U}}\\right) + w_{{\\text{{fair}}}} J(t) - w_{{\\text{{coll}}}} N_{{\\text{{coll}}}}$$
-Empirical normalization constants extracted from `load_kpi()`:
-- Throughput: $\\mu_T = {align_meta.get('snr_mean', 42.1):.1f}\\text{{ Mbps}}$
-- Latency: $\\mu_L = 11.6\\text{{ ms}}$
-- PRB Utilization: $\\mu_U = 0.30$
-
-## 3. Simulator Realism Validation (KS Test Sanity Check)
-
-To validate that our composed simulator accurately reflects real-world cellular distributions rather than artificial synthetic artifacts, we performed a two-sample Kolmogorov-Smirnov (KS) test against empirical traces:
-- **Throughput KS Statistic**: $D = {ks_report['throughput_ks_statistic']:.4f}$ ($p = {ks_report['throughput_p_value']:.4e}$)
-- **Latency KS Statistic**: $D = {ks_report['latency_ks_statistic']:.4f}$ ($p = {ks_report['latency_p_value']:.4e}$)
-
-The close match between empirical and simulated probability density functions (saved in `results/plots/kpi_distribution_comparison.png`) rigorously confirms the physical fidelity of the simulation environment.
-
-## 4. Benchmark Results & Key Findings
-
-The Dueling Double Deep Q-Network (DDQN) with supervised XGBoost warm-start consistently outperforms both static round-robin and proportional-fair baselines:
-- **Throughput Improvements**: Up to **{df_improvements['Throughput Gain vs Static (%)'].max()}%** gain over static baseline under congested traffic conditions.
-- **Latency Reductions**: Up to **{df_improvements['Latency Reduction vs Static (%)'].max()}%** queue delay reduction due to adaptive demand-priority matching.
-- **Cognitive PU Protection**: Drastic reduction in Primary User collision rate ({df_improvements['PU Collision Reduction (% pts)'].max()} percentage points reduction) through learned spectrum sensing avoidance.
-- **Fairness**: Maintains high Jain's fairness index ($\sim {df_improvements['DRL Fairness Index'].mean():.3f}$) preventing user starvation.
-
-These results validate the hypothesis that learning-driven adaptive allocators can maximize 5G/6G spectrum efficiency while upholding strict cognitive radio non-interference guarantees.
-"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        burn = 200
+        t = np.array(truth)[burn:]
+        for name, p in (
+            ("Energy detector (classical)", p_ed),
+            ("Learned GRU (proposed)", p_gru),
+            ("Bayes-optimal (upper bound)", p_bf),
+        ):
+            r = classification_report(t, np.array(p)[burn:])
+            r.update({"congestion": level, "estimator": name})
+            rows.append(r)
+    return pd.DataFrame(rows)
 
 
-def _plot_benchmark_bars(df_results: pd.DataFrame, output_file: Path) -> None:
-    """Plot multi-panel bar charts comparing allocators across metrics."""
-    sns.set_theme(style="whitegrid", font="sans-serif")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+# ---------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------
+def headline_table(df: pd.DataFrame, proposed: str, seeds: List[int]) -> pd.DataFrame:
+    """Proposed vs. the best classical scheduler per metric, with CIs and tests."""
+    classical = [
+        n for n in df["allocator"].unique()
+        if n != proposed and "ablation" not in n and "learned sensing" not in n
+    ]
+    rows = []
+    for level in df["congestion"].unique():
+        sub = df[df["congestion"] == level]
+        ours = sub[sub["allocator"] == proposed].sort_values("seed")
 
-    palette = sns.color_palette("Set2", n_colors=df_results["Allocator"].nunique())
+        for key, label in HEADLINE_METRICS:
+            higher = key in HIGHER_IS_BETTER
+            # Pick the strongest classical comparator for this metric.
+            best_name, best_val = None, None
+            for name in classical:
+                v = sub[sub["allocator"] == name][key].mean()
+                if best_val is None or (v > best_val if higher else v < best_val):
+                    best_name, best_val = name, v
 
-    # 1. Throughput
-    sns.barplot(data=df_results, x="Congestion", y="Throughput (Mbps)", hue="Allocator", ax=axes[0, 0], palette=palette)
-    axes[0, 0].set_title("Aggregate Throughput (Mbps) by Congestion Tier", fontsize=12, fontweight="bold")
-    axes[0, 0].set_ylabel("Throughput (Mbps)")
-    axes[0, 0].get_legend().remove()
+            base = sub[sub["allocator"] == best_name].sort_values("seed")
+            a = ours[key].to_numpy()
+            b = base[key].to_numpy()
+            mean_a, lo_a, hi_a = bootstrap_ci(a)
+            mean_b, lo_b, hi_b = bootstrap_ci(b)
 
-    # 2. Latency
-    sns.barplot(data=df_results, x="Congestion", y="Latency Mean (ms)", hue="Allocator", ax=axes[0, 1], palette=palette)
-    axes[0, 1].set_title("Mean Latency (ms) by Congestion Tier (Lower is Better)", fontsize=12, fontweight="bold")
-    axes[0, 1].set_ylabel("Mean Latency (ms)")
-    axes[0, 1].get_legend().remove()
+            if higher:
+                rel = 100.0 * (mean_a - mean_b) / abs(mean_b) if mean_b else float("nan")
+            else:
+                rel = 100.0 * (mean_b - mean_a) / abs(mean_b) if mean_b else float("nan")
 
-    # 3. Jain's Fairness
-    sns.barplot(data=df_results, x="Congestion", y="Jain's Fairness", hue="Allocator", ax=axes[1, 0], palette=palette)
-    axes[1, 0].set_title("Jain's Fairness Index (Higher is Better)", fontsize=12, fontweight="bold")
-    axes[1, 0].set_ylabel("Fairness Index [0, 1]")
-    axes[1, 0].set_ylim(0, 1.05)
-    axes[1, 0].get_legend().remove()
+            test = wilcoxon_signed_rank(a, b)
+            rows.append({
+                "congestion": level,
+                "metric": label,
+                "best_classical": best_name,
+                "classical_mean": mean_b,
+                "classical_ci": f"[{lo_b:.3g}, {hi_b:.3g}]",
+                "proposed_mean": mean_a,
+                "proposed_ci": f"[{lo_a:.3g}, {hi_a:.3g}]",
+                "improvement_pct": rel,
+                "p_value": test["p_value"],
+                "cliffs_delta": cliffs_delta(a, b),
+            })
+    return pd.DataFrame(rows)
 
-    # 4. QoS Satisfaction Rate
-    sns.barplot(data=df_results, x="Congestion", y="QoS Satisfaction (%)", hue="Allocator", ax=axes[1, 1], palette=palette)
-    axes[1, 1].set_title("QoS SLA Satisfaction Rate (%)", fontsize=12, fontweight="bold")
-    axes[1, 1].set_ylabel("Satisfied Users (%)")
-    axes[1, 1].set_ylim(0, 105)
 
-    # Shared Legend
-    handles, labels = axes[1, 1].get_legend_handles_labels()
-    axes[1, 1].get_legend().remove()
-    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.02), fontsize=11, frameon=True)
+def write_markdown(path: Path, df_kpi: pd.DataFrame, head: pd.DataFrame,
+                   pred: pd.DataFrame, n_seeds: int, slots: int) -> None:
+    lines: List[str] = []
+    ap = lines.append
+    ap("# Intelligent Spectrum Allocation for 5G/6G -- Benchmark Report\n")
+    ap(f"Paired evaluation over **{n_seeds} seeds** x **{len(LEVELS)} congestion regimes**, "
+       f"{slots} slots ({slots * 0.5:.0f} ms) per episode.\n")
+    ap("Every allocator sees the identical observation -- buffer status, aged CQI "
+       "reports and the output of one shared energy detector. The incumbent's true "
+       "occupancy is never exposed to any of them.\n")
 
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.08)
-    fig.savefig(output_file, dpi=300, bbox_inches="tight")
+    ap("\n## 1. Incumbent-occupancy estimation\n")
+    if not pred.empty:
+        agg = (pred.groupby("estimator", sort=False)
+               [["accuracy", "precision", "recall", "f1", "auc", "miss_rate", "false_alarm_rate"]]
+               .mean().round(4))
+        ap(agg.to_markdown())
+        ap("\nAveraged over all four congestion regimes on held-out traces. "
+           "The Bayes-optimal filter is given the true Markov transition matrix and "
+           "detector calibration, so it bounds what any estimator can achieve from "
+           "the sensing stream alone.\n")
+
+    ap("\n## 2. Headline system KPIs\n")
+    for level in LEVELS:
+        sub = head[head["congestion"] == level]
+        if sub.empty:
+            continue
+        ap(f"\n### {level.capitalize()} congestion\n")
+        show = sub[["metric", "best_classical", "classical_mean", "proposed_mean",
+                    "improvement_pct", "p_value"]].copy()
+        show.columns = ["Metric", "Best classical", "Classical", "Proposed", "Improvement %", "p"]
+        show["Classical"] = show["Classical"].map(lambda v: f"{v:,.3g}")
+        show["Proposed"] = show["Proposed"].map(lambda v: f"{v:,.3g}")
+        show["Improvement %"] = show["Improvement %"].map(lambda v: f"{v:+.1f}")
+        show["p"] = show["p"].map(lambda v: f"{v:.3f}" if v == v else "n/a")
+        ap(show.to_markdown(index=False))
+
+    ap("\n## 3. All allocators, all regimes\n")
+    pivot = (df_kpi.groupby(["congestion", "allocator"], sort=False)
+             [["qos_satisfaction_pct", "goodput_mbps", "deadline_miss_pct",
+               "collision_pct", "jain_fairness", "p99_delay_ms"]]
+             .mean().round(2))
+    ap(pivot.to_markdown())
+
+    ap("\n## 4. Parameter provenance\n")
+    for k, v in PARAMETER_PROVENANCE.items():
+        ap(f"- `{k}` -- {v}")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def make_plots(df: pd.DataFrame, pred: pd.DataFrame, proposed: str, out: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out.mkdir(parents=True, exist_ok=True)
+    order = [n for n in df["allocator"].unique() if "ablation" not in n]
+
+    # -- 1. KPI bars per regime -----------------------------------------
+    panels = [
+        ("qos_satisfaction_pct", "QoS satisfaction (%)"),
+        ("goodput_mbps", "Goodput (Mb/s)"),
+        ("deadline_miss_pct", "Deadline misses (%)"),
+        ("collision_pct", "Incumbent collisions (%)"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    x = np.arange(len(LEVELS))
+    width = 0.8 / len(order)
+    for ax, (key, label) in zip(axes.ravel(), panels):
+        for i, name in enumerate(order):
+            vals = [df[(df["allocator"] == name) & (df["congestion"] == lv)][key].mean()
+                    for lv in LEVELS]
+            ax.bar(x + i * width, vals, width,
+                   label=name if ax is axes[0, 0] else None,
+                   color="#2f6fdb" if name == proposed else None,
+                   edgecolor="white", linewidth=0.5)
+        ax.set_xticks(x + 0.4 - width / 2)
+        ax.set_xticklabels([lv.capitalize() for lv in LEVELS])
+        ax.set_title(label, fontsize=11)
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_axisbelow(True)
+    axes[0, 0].legend(fontsize=8, ncol=2)
+    fig.suptitle("Existing schedulers vs. proposed RL allocator", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out / "kpi_comparison.png", dpi=150)
     plt.close(fig)
 
+    # -- 2. Predictor accuracy ------------------------------------------
+    if not pred.empty:
+        agg = pred.groupby("estimator", sort=False)[
+            ["accuracy", "precision", "recall", "f1", "auc"]].mean()
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        m = np.arange(5)
+        w = 0.26
+        for i, (name, row) in enumerate(agg.iterrows()):
+            ax.bar(m + i * w, row.values, w, label=name, edgecolor="white", linewidth=0.5)
+        ax.set_xticks(m + w)
+        ax.set_xticklabels(["Accuracy", "Precision", "Recall", "F1", "AUC"])
+        ax.set_ylim(0.5, 1.02)
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_axisbelow(True)
+        ax.legend(fontsize=9, loc="lower right")
+        ax.set_title("Incumbent-occupancy estimation quality")
+        fig.tight_layout()
+        fig.savefig(out / "predictor_accuracy.png", dpi=150)
+        plt.close(fig)
 
-def _plot_ks_sanity_check(
-    empirical_thpt: np.ndarray,
-    sim_thpt: np.ndarray,
-    empirical_lat: np.ndarray,
-    sim_lat: np.ndarray,
-    ks_report: Dict[str, Any],
-    output_file: Path
-) -> None:
-    """Plot side-by-side distribution matching and empirical CDFs."""
-    sns.set_theme(style="whitegrid")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
-
-    # Throughput Distribution
-    sns.kdeplot(empirical_thpt, ax=axes[0], label="Empirical 5G KPI Dataset", color="#2b5c8f", fill=True, alpha=0.3, linewidth=2)
-    sns.kdeplot(sim_thpt, ax=axes[0], label="Composed Simulator (DRL)", color="#e05d44", fill=True, alpha=0.3, linewidth=2)
-    axes[0].set_title(f"Throughput Distribution (KS D={ks_report['throughput_ks_statistic']:.3f}, p={ks_report['throughput_p_value']:.2e})",
-                      fontweight="bold")
-    axes[0].set_xlabel("Throughput (Mbps)")
-    axes[0].set_ylabel("Probability Density")
-    axes[0].set_xlim(0, 250)
-    axes[0].legend(loc="upper right")
-
-    # Latency Distribution
-    sns.kdeplot(empirical_lat, ax=axes[1], label="Empirical 5G KPI Dataset", color="#2b5c8f", fill=True, alpha=0.3, linewidth=2)
-    sns.kdeplot(sim_lat, ax=axes[1], label="Composed Simulator (DRL)", color="#e05d44", fill=True, alpha=0.3, linewidth=2)
-    axes[1].set_title(f"Latency Distribution (KS D={ks_report['latency_ks_statistic']:.3f}, p={ks_report['latency_p_value']:.2e})",
-                      fontweight="bold")
-    axes[1].set_xlabel("Latency (ms)")
-    axes[1].set_ylabel("Probability Density")
-    axes[1].set_xlim(0, 60)
-    axes[1].legend(loc="upper right")
-
-    plt.tight_layout()
-    fig.savefig(output_file, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    # -- 3. QoS by traffic class ----------------------------------------
+    class_keys = [k for k in df.columns if k.startswith("qos_") and k.endswith("_pct")
+                  and k != "qos_satisfaction_pct"]
+    if class_keys:
+        fig, ax = plt.subplots(figsize=(11, 4.8))
+        labels = [k[4:-4] for k in class_keys]
+        m = np.arange(len(class_keys))
+        w = 0.8 / len(order)
+        for i, name in enumerate(order):
+            sub = df[df["allocator"] == name]
+            ax.bar(m + i * w, [sub[k].mean() for k in class_keys], w, label=name,
+                   color="#2f6fdb" if name == proposed else None,
+                   edgecolor="white", linewidth=0.5)
+        ax.set_xticks(m + 0.4 - w / 2)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel("QoS satisfaction (%)")
+        ax.set_title("QoS satisfaction by 5QI traffic class (all regimes pooled)")
+        ax.grid(axis="y", alpha=0.25)
+        ax.set_axisbelow(True)
+        ax.legend(fontsize=8, ncol=2)
+        fig.tight_layout()
+        fig.savefig(out / "qos_by_class.png", dpi=150)
+        plt.close(fig)
 
 
-def _plot_fairness_vs_congestion(df_results: pd.DataFrame, output_file: Path) -> None:
-    """Plot line chart showing fairness degradation resilience across congestion tiers."""
-    sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument("--slots", type=int, default=1000)
+    ap.add_argument("--no-ablations", dest="ablations", action="store_false")
+    ap.add_argument("--levels", nargs="*", default=LEVELS)
+    args = ap.parse_args()
 
-    sns.lineplot(
-        data=df_results,
-        x="Congestion",
-        y="Jain's Fairness",
-        hue="Allocator",
-        style="Allocator",
-        markers=True,
-        dashes=False,
-        linewidth=2.5,
-        markersize=8,
-        ax=ax
-    )
+    RESULTS.mkdir(exist_ok=True)
+    (RESULTS / "plots").mkdir(exist_ok=True)
+    seeds = [1000 + 97 * i for i in range(args.seeds)]
 
-    ax.set_title("Fairness Resilience Across Increasing Network Congestion", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Jain's Fairness Index")
-    ax.set_xlabel("Network Congestion Tier")
-    ax.set_ylim(0.0, 1.05)
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", frameon=True)
+    print(f"Benchmarking over {args.seeds} seeds x {len(args.levels)} regimes...")
+    allocators = build_allocators(args)
+    proposed = NeuroSpectrumAllocator.name
 
-    plt.tight_layout()
-    fig.savefig(output_file, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    df = run_benchmark(allocators, seeds, args.levels, args.slots)
+    df.to_csv(RESULTS / "kpi_by_regime.csv", index=False)
+
+    pred = predictor_accuracy()
+    if not pred.empty:
+        pred.to_csv(RESULTS / "predictor_accuracy.csv", index=False)
+
+    head = headline_table(df, proposed, seeds)
+    head.to_csv(RESULTS / "headline.csv", index=False)
+
+    # Plain M-LWDF is included as the reference point the decomposition builds on:
+    # M-LWDF -> + learned sensing -> + learned scheduler (BC) -> + RL.
+    abl = (df[df["allocator"].str.contains(
+                "^M-LWDF$|ablation|learned sensing|NeuroSpectrum", regex=True)]
+           .groupby("allocator", sort=False)
+           [["qos_satisfaction_pct", "goodput_mbps", "deadline_miss_pct",
+             "collision_pct", "wasted_vacancy_pct", "jain_fairness"]]
+           .mean().round(3))
+    abl.to_csv(RESULTS / "ablation.csv")
+
+    write_markdown(RESULTS / "benchmark_report.md", df, head, pred, args.seeds, args.slots)
+    make_plots(df, pred, proposed, RESULTS / "plots")
+
+    # -- console summary --------------------------------------------------
+    print("\n" + "=" * 78)
+    print("HEADLINE: proposed vs. best classical scheduler")
+    print("=" * 78)
+    for level in args.levels:
+        sub = head[head["congestion"] == level]
+        print(f"\n{level.upper()}")
+        for _, r in sub.iterrows():
+            flag = "*" if r["p_value"] == r["p_value"] and r["p_value"] < 0.05 else " "
+            print(f"  {flag} {r['metric']:<32s} {r['classical_mean']:>9.3f} -> "
+                  f"{r['proposed_mean']:>9.3f}  ({r['improvement_pct']:+6.1f}%)  "
+                  f"vs {r['best_classical']}")
+    print("\n  (* = paired Wilcoxon p < 0.05)")
+    print("\nWrote results/ -- benchmark_report.md, kpi_by_regime.csv, headline.csv, plots/")
 
 
 if __name__ == "__main__":
-    print("Running 5G/6G Spectrum Allocation Evaluation Suite...")
-    df_res, ks_rep = run_benchmark(num_users=20, num_channels=8, timesteps=15, episodes=2, quick_drl_train=True)
-    print("\n=== Benchmark Results Preview ===")
-    print(df_res.head(10).to_string())
-    print("\n=== KS Test Sanity Check ===")
-    print(f"Throughput KS: D={ks_rep['throughput_ks_statistic']:.4f}, p={ks_rep['throughput_p_value']:.4e}")
-    print(f"Latency KS: D={ks_rep['latency_ks_statistic']:.4f}, p={ks_rep['latency_p_value']:.4e}")
-    print("\nEvaluation successfully completed and artifacts exported to results/!")
+    main()
