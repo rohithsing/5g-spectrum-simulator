@@ -9,7 +9,7 @@ Stage 2  Scheduling policy   -- PPO, in the simulator, with the stage-1
 Artifacts land in ``artifacts/`` and are consumed by ``evaluate.py`` and
 ``app.py``.
 
-    python train.py                 # full run (~30 min on CPU)
+    python train.py                 # full run (~55 min on CPU)
     python train.py --quick         # ~4 min smoke run
 """
 
@@ -152,32 +152,47 @@ def stage2_policy(predictor: GRUPredictor, args) -> SchedulerPolicy:
     )
     trainer = PPOTrainer(policy, predictor, ppo_cfg)
 
+    # Written every iteration so an interrupted run is never wasted.
     def checkpoint(iteration: int, stats: dict) -> None:
-        """Persist after every iteration so an interrupted run is never wasted."""
-        torch.save(policy.state_dict(), ARTIFACTS / "policy.pt")
+        torch.save(policy.state_dict(), ARTIFACTS / "policy_last.pt")
         with open(ARTIFACTS / "ppo_history.json", "w", encoding="utf-8") as fh:
             json.dump(trainer.history, fh, indent=2)
 
     history = trainer.train(verbose=True, callback=checkpoint)
 
-    torch.save(policy.state_dict(), ARTIFACTS / "policy.pt")
     with open(ARTIFACTS / "ppo_history.json", "w", encoding="utf-8") as fh:
         json.dump(history, fh, indent=2)
-    print(f"  saved artifacts/policy.pt   ({time.perf_counter() - t0:.0f}s)")
+    # policy.pt is the final iterate, full stop. No checkpoint is selected on
+    # the training reward, and none is selected on a handful of extra episodes
+    # either: both were tried and both turned out to be noise-mining. Selecting
+    # the best 3-iteration smoothed reward shipped a checkpoint worse than the
+    # final iterate on held-out seeds, and selecting between the clone and the
+    # final iterate on 12 held-out episodes reversed its verdict on the 32-episode
+    # benchmark. RL's actual contribution is small enough here that only a paired
+    # test over the full benchmark can see it, so that is where it is measured:
+    # evaluate.py carries the clone as an ablation arm and reports the comparison.
+    torch.save(policy.state_dict(), ARTIFACTS / "policy.pt")
+    torch.save(policy.state_dict(), ARTIFACTS / "policy_last.pt")
+    print(
+        f"  saved artifacts/policy.pt (final PPO iterate)   "
+        f"({time.perf_counter() - t0:.0f}s)"
+    )
     return policy
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--quick", action="store_true", help="fast smoke run")
-    ap.add_argument("--iterations", type=int, default=40, help="PPO iterations")
+    ap.add_argument("--iterations", type=int, default=120, help="PPO iterations")
     ap.add_argument("--rollout", type=int, default=1500,
                     help="slots per PPO rollout; keep it a whole multiple of "
                          "episode length x number of congestion regimes")
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=1e-4,
+                    help="PPO learning rate; 3e-4 was tuned against a KL anchor "
+                         "that never released and overshoots once it does")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--bc-slots", type=int, default=6000, help="M-LWDF demonstration slots")
-    ap.add_argument("--bc-epochs", type=int, default=12)
+    ap.add_argument("--bc-slots", type=int, default=12000, help="teacher demonstration slots")
+    ap.add_argument("--bc-epochs", type=int, default=30)
     ap.add_argument("--skip-predictor", action="store_true",
                     help="reuse artifacts/predictor.pt instead of retraining it")
     ap.add_argument("--skip-bc", action="store_true",

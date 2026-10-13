@@ -128,9 +128,20 @@ def behaviour_clone(
     seed: int = 0,
     verbose: bool = True,
 ) -> List[float]:
-    """Fit the policy's assignment distribution to the teacher's choices."""
+    """
+    Fit the policy's assignment distribution to the teacher's choices.
+
+    The learning rate is cosine-annealed to zero over the run. Imitation
+    fidelity is the binding constraint on the whole pipeline: PPO is anchored to
+    this clone, so whatever the clone fails to reproduce is a ceiling RL starts
+    below and cannot climb past. A flat learning rate left the clone at 66 %
+    teacher-match -- which is underfitting, not a capacity limit, because the
+    factored logit ``score_u + gain_u * z_uk`` represents M-LWDF's
+    ``log(urgency_u / R_u) + log(bits_uk)`` exactly when ``gain_u`` is constant.
+    """
     gen = torch.Generator().manual_seed(seed)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
 
     data = {
         "ue": torch.from_numpy(demos["ue"]),
@@ -166,12 +177,14 @@ def behaviour_clone(
             seen += idx.numel()
             correct += int((masked.argmax(-1) == tgt).float().sum())
 
+        sched.step()
         mean_loss = total / max(seen, 1)
         acc = correct / max(seen * data["actions"].shape[1], 1)
         losses.append(mean_loss)
         if verbose:
             print(f"  BC epoch {epoch + 1}/{epochs}  loss {mean_loss:.4f}  "
-                  f"teacher-match {acc:.1%}", flush=True)
+                  f"teacher-match {acc:.1%}  lr {opt.param_groups[0]['lr']:.2e}",
+                  flush=True)
 
     return losses
 

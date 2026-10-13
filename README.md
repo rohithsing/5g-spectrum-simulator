@@ -4,10 +4,32 @@ A reinforcement-learning dynamic spectrum allocator, benchmarked against the
 schedulers actually deployed in LTE/NR base stations today, inside a 3GPP-grounded
 simulator.
 
-The project's claim is narrow and testable: **given exactly the same information a
-real gNB scheduler has, a learned allocator serves more users inside their QoS
-contracts and causes less harmful interference to the incumbent than Round-Robin,
-Proportional Fair, Max-C/I, M-LWDF or EXP/PF.**
+The project's question is narrow and testable: **given exactly the same
+information a real gNB scheduler has, what does learning actually buy over
+Round-Robin, Proportional Fair, Max-C/I, M-LWDF and EXP/PF?**
+
+The answer the measurements support, stated up front:
+
+* **Occupancy estimation is where learning wins decisively.** A GRU filter over
+  the sensing stream reaches 0.977 accuracy against the energy detector's 0.872,
+  cutting missed detections 3.4× and false alarms 7.5× *at the same time* — and
+  lands within 0.2 pp of a Bayes-optimal bound, capturing ~98 % of what is
+  recoverable from that stream.
+* **That translates into large, significant spectrum-sharing gains.** Harmful
+  interference to the incumbent falls by **51–72 %** in every congestion regime
+  (paired Wilcoxon p < 0.05), and wasted idle spectrum falls by 60–77 % under
+  medium load and above.
+* **It does not translate into a QoS win.** The learned allocator is not
+  significantly better than the best classical scheduler on QoS satisfaction in
+  any regime, and is significantly worse at medium load and on goodput, p99 delay
+  and fairness under heavy load.
+* **The honest best system is a hybrid**: keep M-LWDF and replace only its
+  sensing front-end with the learned filter. It beats the fully learned allocator
+  on QoS, goodput, collisions, wasted vacancy and fairness.
+
+So the contribution is the sensing, not the scheduling. The full decomposition,
+the paired statistics and the reason the RL objective and the QoS metric disagree
+are in `PROJECTGUIDE.md` §12.
 
 ---
 
@@ -72,10 +94,14 @@ impossible. Each RBG may also be muted, and that decision is driven by the
 predictor's output.
 
 Trained by **behaviour cloning, then PPO** (`spectrum/bc.py`, `spectrum/ppo.py`).
-The warm start matters for the integrity of the result: PPO begins at parity with
-the strongest non-RL scheduler rather than far below it, so the reported gain is
-unambiguously what reinforcement learning *added*. The pre-RL checkpoint is kept
-and reported as an ablation.
+The warm start matters for the integrity of the result: PPO begins near parity
+with the strongest non-RL scheduler rather than far below it, so the reported
+gain is unambiguously what reinforcement learning *added*. The pre-RL checkpoint
+is kept and reported as an ablation — and it earns its place, because the honest
+answer is that RL adds very little here. Cloning fidelity turned out to matter
+far more than any PPO hyper-parameter: a flat learning rate reproduced only
+66.4 % of the teacher's decisions, cosine annealing reaches 77.1 %, and that
+single change was worth more than every RL fix combined.
 
 The teacher is M-LWDF driven by the learned occupancy estimate, not plain M-LWDF.
 That detail is load-bearing: plain M-LWDF mutes exactly when the hard sensing bit
@@ -96,9 +122,9 @@ Held-out traces, averaged over all four congestion regimes:
 
 | Estimator | Accuracy | Precision | Recall | F1 | AUC | Missed detections | False alarms |
 |---|---|---|---|---|---|---|---|
-| Energy detector (classical) | 0.871 | 0.722 | 0.851 | 0.774 | 0.865 | 14.9 % | 12.1 % |
-| **Learned GRU (proposed)** | **0.976** | **0.961** | **0.956** | **0.959** | **0.995** | **4.4 %** | **1.7 %** |
-| Bayes-optimal (upper bound) | 0.978 | 0.968 | 0.957 | 0.963 | 0.996 | 4.3 % | 1.6 % |
+| Energy detector (classical) | 0.872 | 0.690 | 0.850 | 0.753 | 0.865 | 15.0 % | 12.1 % |
+| **Learned GRU (proposed)** | **0.977** | **0.956** | **0.956** | **0.956** | **0.995** | **4.4 %** | **1.6 %** |
+| Bayes-optimal (upper bound) | 0.979 | 0.965 | 0.956 | 0.960 | 0.996 | 4.4 % | 1.5 % |
 
 The Bayes-optimal row is the HMM forward filter *given the true model parameters*.
 It is not deployable — it exists to show how much of the achievable gain the learned
@@ -109,15 +135,50 @@ detector — lowering the threshold trades false alarms for missed detections an
 vice versa. A missed detection is harmful interference to the incumbent; a false
 alarm is spectrum thrown away. Because the learned filter integrates evidence over
 a burst instead of moving a threshold, it reduces missed detections by **3.4×** and
-false alarms by **7.0×** *simultaneously*, which no choice of operating point on
+false alarms by **7.5×** *simultaneously*, which no choice of operating point on
 the classical detector's ROC curve can do.
 
 ### System KPIs
 
-See `results/benchmark_report.md` and `results/plots/`. Every comparison is paired —
-each allocator faces an identical UE drop, traffic realisation and incumbent
-trajectory — and is reported with a bootstrap 95 % CI, a paired Wilcoxon
-signed-rank p-value and Cliff's delta.
+Proposed vs. the strongest classical scheduler **for each metric separately** —
+which is the hardest available comparison, since no single classical scheduler is
+best at everything. `*` marks paired Wilcoxon p < 0.05.
+
+| Metric | low | medium | high | peak |
+|---|---|---|---|---|
+| QoS satisfaction | −1.2 % | −31.3 %* | −5.0 % | +25.6 % |
+| Goodput | −9.7 % | +3.2 % | −15.5 %* | −19.2 %* |
+| p99 delay | −7.3 % | +10.6 % | −23.9 %* | −16.2 %* |
+| Jain fairness | −8.7 % | −6.3 %* | −8.5 %* | −8.8 %* |
+| Deadline misses | n/a | +60.0 % | +2.8 % | +10.2 %* |
+| **Incumbent collisions** | **+51.3 %*** | **+50.6 %*** | **+61.1 %*** | **+72.4 %*** |
+| **Wasted vacancy** | −86.6 %* | **+76.5 %*** | **+68.4 %*** | **+59.5 %*** |
+
+Eight significant wins, eleven significant losses, and the split is systematic:
+the learned allocator dominates on how it *shares* the band and pays for it in
+raw throughput and fairness when the cell is overloaded. The −86.6 % at low load
+is the worst number here — at a 12 % incumbent duty cycle the policy mutes far
+more idle spectrum than it needs to.
+
+### Component decomposition
+
+| Allocator | QoS % | Goodput | Collision % | Wasted vac % |
+|---|---|---|---|---|
+| M-LWDF | 45.74 | 159.5 | 6.82 | 22.79 |
+| **M-LWDF + learned sensing** | **49.52** | **171.9** | **2.11** | **15.57** |
+| Learned scheduler, classical sensing | 43.64 | 161.9 | 7.06 | 23.38 |
+| Learned scheduler, no RL (clone only) | 46.71 | 164.1 | 2.58 | 17.40 |
+| Learned scheduler + RL (proposed) | 47.37 | 169.5 | 2.45 | 17.10 |
+
+Row 1 → row 2 swaps *only* the sensing front-end and moves every metric. Row 3 is
+the converse and gains nothing. Rows 4 → 5 isolate PPO, whose only statistically
+significant effect across seven metrics is a 1.0 pp reduction in deadline misses
+(p = 0.011).
+
+Every comparison is paired — each allocator faces an identical UE drop, traffic
+realisation and incumbent trajectory — and is reported with a bootstrap 95 % CI, a
+paired Wilcoxon signed-rank p-value and Cliff's delta. Full tables in
+`results/benchmark_report.md` and `results/plots/`.
 
 ---
 
@@ -138,7 +199,7 @@ spectrum/
   ppo.py          PPO trainer
   agent.py        The proposed allocator, plus ablation wrappers
   runner.py       Episode runner shared by training, evaluation and the dashboard
-train.py          Stage 1 predictor -> Stage 2 BC + PPO   (~35 min, CPU)
+train.py          Stage 1 predictor -> Stage 2 BC + PPO   (~55 min, CPU)
 evaluate.py       Paired benchmark, statistics, plots, report
 app.py            Streamlit dashboard
 tests/            Physics, allocator contract, and information-parity tests
@@ -151,11 +212,11 @@ tests/            Physics, allocator contract, and information-parity tests
 ```bash
 pip install -r requirements.txt
 
-python train.py                  # ~35 min on CPU; --quick for a 4 min smoke run
+python train.py                  # ~55 min on CPU; --quick for a 4 min smoke run
 python evaluate.py               # paired benchmark -> results/
 streamlit run app.py             # interactive comparison
 
-python -m pytest tests/ -q       # 50 tests: physics, contracts, information parity
+python -m pytest tests/ -q       # 52 tests: physics, contracts, information parity
 ```
 
 `train.py` writes `artifacts/`:
@@ -163,9 +224,20 @@ python -m pytest tests/ -q       # 50 tests: physics, contracts, information par
 | File | What it is |
 |---|---|
 | `predictor.pt` | GRU occupancy filter |
-| `policy_bc.pt` | policy after imitating M-LWDF, before RL (ablation checkpoint) |
-| `policy.pt` | final policy after PPO |
+| `policy_bc.pt` | policy after imitating the teacher, before RL (ablation checkpoint) |
+| `policy.pt` | the final PPO iterate — what the benchmark calls "proposed" |
+| `policy_last.pt` | identical copy of the final iterate, kept for auditing |
 | `predictor_report.json`, `ppo_history.json` | training diagnostics |
+
+Per-rollout reward has a standard deviation of ~0.12 here, which is large next to
+any real improvement, so **no checkpoint is selected on the training reward**.
+Two attempts at being cleverer both turned out to mine noise: taking the best
+3-iteration smoothed reward shipped a checkpoint *worse* than the final iterate
+on held-out seeds, and choosing between the clone and the final iterate on 12
+held-out episodes gave a verdict that reversed on the 32-episode benchmark.
+`train.py` therefore ships the final iterate unconditionally, and `evaluate.py`
+carries the behaviour clone as an ablation arm so RL's contribution is measured
+with a paired test over the whole benchmark instead.
 
 ---
 
@@ -209,6 +281,17 @@ counted as such.
   have structured duty cycles that would be *easier* to predict, so the predictor
   result here is, if anything, conservative.
 * The Bayes-optimal reference is only optimal for this incumbent model.
-* Results are simulator-internal. They demonstrate that the learned policy
-  dominates classical schedulers under these dynamics; they are not a measurement
-  of a deployed network.
+* Results are simulator-internal. They demonstrate how these allocators compare
+  under these dynamics; they are not a measurement of a deployed network.
+* **The learned scheduler does not beat the classical schedulers on QoS.** The
+  gain is in incumbent protection and spectrum reclamation, and the strongest
+  allocator overall is the M-LWDF + learned-sensing hybrid, not the fully learned
+  one.
+* **The RL objective is not the reported KPI.** PPO raises reward/slot from 1.51
+  to 1.6–1.74 — real optimisation — while QoS satisfaction moves +0.65 pp at
+  p = 0.269. The reward sums packet outcomes cell-wide; QoS satisfaction counts
+  UEs meeting a two-sided per-UE contract, and the two are not the same problem.
+  Fixing that, not more RL tuning, is the open work.
+* Reward per rollout has σ ≈ 0.12, which is large relative to any real
+  improvement. Checkpoints here must not be selected on training reward, and
+  `train.py` therefore ships the final iterate rather than a "best" one.

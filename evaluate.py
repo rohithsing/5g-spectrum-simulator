@@ -168,17 +168,33 @@ def build_allocators(args) -> List:
                 pol_no_pred, predictor=None, name="NeuroSpectrum, hard sensing (ablation)"
             )
         )
-        # (c) behaviour-cloned policy before any RL
-        bc_path = ARTIFACTS / "policy_bc.pt"
-        if bc_path.exists():
-            pol_bc = SchedulerPolicy()
-            pol_bc.load_state_dict(torch.load(bc_path, map_location="cpu"))
-            pol_bc.eval()
-            allocators.append(
-                NeuroSpectrumAllocator(
-                    pol_bc, predictor, name="NeuroSpectrum, BC only / no RL (ablation)"
-                )
-            )
+        # (c) the pre-RL end of the pipeline. policy.pt is the final PPO
+        # iterate, so carrying the clone here is what makes RL's marginal
+        # contribution measurable rather than assumed -- and on this problem it
+        # is small enough that only a paired test over the whole benchmark can
+        # see it (one significant metric out of seven).
+        #
+        # Checkpoints are compared by *weights*, not by file bytes: policy.pt
+        # may have been written by a load/save round-trip, which produces a
+        # different serialisation of an identical model and would silently put a
+        # duplicate row in every table.
+        def same_weights(a: Path, b: Path) -> bool:
+            sa = torch.load(a, map_location="cpu")
+            sb = torch.load(b, map_location="cpu")
+            if sa.keys() != sb.keys():
+                return False
+            return all(torch.equal(sa[k], sb[k]) for k in sa)
+
+        for path, label in (
+            (ARTIFACTS / "policy_bc.pt", "NeuroSpectrum, BC only / no RL (ablation)"),
+            (ARTIFACTS / "policy_last.pt", "NeuroSpectrum, after PPO (ablation)"),
+        ):
+            if not path.exists() or same_weights(path, policy_path):
+                continue  # this one *is* the shipped policy; no duplicate row
+            pol_alt = SchedulerPolicy()
+            pol_alt.load_state_dict(torch.load(path, map_location="cpu"))
+            pol_alt.eval()
+            allocators.append(NeuroSpectrumAllocator(pol_alt, predictor, name=label))
 
     allocators.append(NeuroSpectrumAllocator.load(policy_path, predictor_path))
     return allocators
@@ -455,8 +471,9 @@ def main() -> None:
     head = headline_table(df, proposed, seeds)
     head.to_csv(RESULTS / "headline.csv", index=False)
 
-    # Plain M-LWDF is included as the reference point the decomposition builds on:
-    # M-LWDF -> + learned sensing -> + learned scheduler (BC) -> + RL.
+    # Plain M-LWDF is the reference point the decomposition builds on:
+    # M-LWDF -> + learned sensing -> + learned scheduler -> + PPO.
+    # The last step is reported whichever way it came out.
     abl = (df[df["allocator"].str.contains(
                 "^M-LWDF$|ablation|learned sensing|NeuroSpectrum", regex=True)]
            .groupby("allocator", sort=False)

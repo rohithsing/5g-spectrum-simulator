@@ -47,7 +47,11 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     #: Stop the update early once the mean per-decision KL from the rollout
     #: policy exceeds this. Protects the behaviour-cloned initialisation.
-    target_kl: float = 0.015
+    #: At 0.015 this fired on 27.5 % of updates and, combined with a KL anchor
+    #: that never released, pinned the policy to its clone: the reward curve
+    #: over 40 iterations had slope +0.0017/iter against a standard error of
+    #: 0.0013 (t = 1.31), i.e. no measurable learning at all.
+    target_kl: float = 0.03
     #: Weight on KL(pi || pi_reference) against the frozen behaviour-cloned
     #: policy. One scalar advantage per slot has to shape 18 decisions over ~80
     #: candidates each, so the gradient is noisy; without an anchor the policy
@@ -57,8 +61,13 @@ class PPOConfig:
     bc_kl_coef: float = 1.0
     #: The anchor is annealed: strong early, when the value function is
     #: still poor and the advantage is mostly noise, then relaxed so RL can
-    #: actually depart from the teacher once the critic is informative.
-    bc_kl_final: float = 0.1
+    #: actually depart from the teacher once the critic is informative. The
+    #: floor must be near zero or the anchor never releases and RL cannot
+    #: improve on the clone -- a floor of 0.1 was measured to prevent any
+    #: learning. It is not exactly zero because the clone is the only thing
+    #: standing between this policy and the degenerate "mute everything"
+    #: solution, which it rediscovered in 12 iterations when unanchored.
+    bc_kl_final: float = 0.01
     iterations: int = 60
     #: Rewards are divided by this before bootstrapping. It leaves the optimal
     #: policy unchanged (advantages are normalised anyway) but keeps the value
