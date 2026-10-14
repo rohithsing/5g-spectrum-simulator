@@ -87,6 +87,21 @@ class IncumbentProcess:
         #: observation; see ``spectrum.env.SpectrumEnv.observe``.
         self.active = (rng.random(self.n_subbands) < duty).astype(np.int64)
 
+        #: Dwell-time distribution. ``geometric`` makes occupancy a first-order
+        #: Markov chain, which is the family a two-state HMM filter assumes and
+        #: can therefore fit exactly. The concentrated shapes break that
+        #: assumption while holding the mean burst length and duty cycle fixed,
+        #: which is how the benefit of a learned filter is isolated from the
+        #: benefit of merely having memory.
+        self.sojourn = getattr(cfg, "incumbent_sojourn", "geometric")
+        self._remaining = np.ones(self.n_subbands, dtype=np.int64)
+        if self.sojourn != "geometric":
+            # Start mid-dwell so the first burst is not biased long.
+            self._refresh_remaining(np.ones(self.n_subbands, dtype=bool))
+            self._remaining = np.maximum(
+                (rng.random(self.n_subbands) * self._remaining).astype(np.int64), 1
+            )
+
         # Energy-detector calibration. Under H0 the normalised statistic is
         # N(0, 1); under H1 it is N(mu, 1). The threshold is fixed by the
         # required false-alarm rate and mu by the required detection rate.
@@ -94,13 +109,65 @@ class IncumbentProcess:
         self.mu_h1 = self.threshold - _norm_ppf(1.0 - cfg.sensing_prob_detection)
 
     # ---------------------------------------------------------------- dynamics
+    def _draw_sojourn(self, mean: float, n: int) -> np.ndarray:
+        """
+        Draw ``n`` dwell times with the configured shape and the given mean.
+
+        ``geometric`` reproduces a memoryless chain exactly. The others keep the
+        same mean but concentrate the distribution, which is what makes the
+        process genuinely semi-Markov: the hazard of switching then depends on
+        how long the state has already been held, and no two-state Markov chain
+        can represent that.
+        """
+        shape = self.sojourn
+        if shape == "geometric":
+            return self.rng.geometric(1.0 / max(mean, 1.0), size=n).astype(np.int64)
+        if shape == "deterministic":
+            # +-10 % jitter around the mean: a radar-like near-periodic dwell.
+            lo, hi = 0.9 * mean, 1.1 * mean
+            return np.maximum(np.rint(self.rng.uniform(lo, hi, size=n)), 1).astype(np.int64)
+        if shape == "erlang":
+            # Sum of 4 exponentials: same mean, variance cut 4x vs geometric.
+            k = 4
+            draws = self.rng.gamma(shape=k, scale=mean / k, size=n)
+            return np.maximum(np.rint(draws), 1).astype(np.int64)
+        raise ValueError(
+            f"unknown sojourn shape {shape!r}; expected 'geometric', "
+            "'deterministic' or 'erlang'"
+        )
+
+    def _refresh_remaining(self, which: np.ndarray) -> None:
+        """Re-draw dwell times for the subbands flagged in ``which``."""
+        if not np.any(which):
+            return
+        idx = np.flatnonzero(which)
+        busy = self.active[idx] == 1
+        out = np.empty(idx.size, dtype=np.int64)
+        if np.any(busy):
+            out[busy] = self._draw_sojourn(self.mean_on_slots, int(np.sum(busy)))
+        if np.any(~busy):
+            out[~busy] = self._draw_sojourn(self.mean_off_slots, int(np.sum(~busy)))
+        self._remaining[idx] = out
+
     def advance(self) -> None:
         """Evolve occupancy by one slot."""
-        u = self.rng.random(self.n_subbands)
-        idle = self.active == 0
-        turn_on = idle & (u < self.p_on)
-        turn_off = (~idle) & (u < self.p_off)
-        self.active = np.where(turn_on, 1, np.where(turn_off, 0, self.active)).astype(np.int64)
+        if self.sojourn == "geometric":
+            # Memoryless: the explicit countdown is unnecessary and this keeps
+            # the original code path bit-for-bit identical.
+            u = self.rng.random(self.n_subbands)
+            idle = self.active == 0
+            turn_on = idle & (u < self.p_on)
+            turn_off = (~idle) & (u < self.p_off)
+            self.active = np.where(
+                turn_on, 1, np.where(turn_off, 0, self.active)
+            ).astype(np.int64)
+            return
+
+        self._remaining -= 1
+        expired = self._remaining <= 0
+        if np.any(expired):
+            self.active = np.where(expired, 1 - self.active, self.active).astype(np.int64)
+            self._refresh_remaining(expired)
 
     # ----------------------------------------------------------------- sensing
     def sense(self) -> Tuple[np.ndarray, np.ndarray]:

@@ -205,6 +205,12 @@ class SimConfig:
     incumbent_mean_off_slots: float = 128.0
     #: Interference injected into a subband while an incumbent transmits.
     incumbent_interference_dbm: float = -62.0
+    #: Incumbent dwell-time distribution: 'geometric' (memoryless, the default
+    #: and what all headline results use), 'erlang' (variance cut 4x) or
+    #: 'deterministic' (near-periodic, radar-like). Mean burst length and duty
+    #: cycle are held fixed across all three, so switching this changes only
+    #: whether a two-state Markov filter is correctly specified.
+    incumbent_sojourn: str = "geometric"
     #: Energy-detector operating point. Both probabilities are fixed for all
     #: allocators so that information parity is structurally guaranteed.
     sensing_prob_detection: float = 0.85
